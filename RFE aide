@@ -1,0 +1,1181 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Aide RFE  –  Gestion tiers Sage / SIRENE
+Interface moderne avec filtres par colonne et tri
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+import requests
+import csv
+import time
+import os
+import sys
+import subprocess
+import unicodedata
+
+# ── Dépendances optionnelles ────────────────────────────────
+try:    import pyodbc;         HAS_PYODBC   = True
+except: HAS_PYODBC   = False
+try:    import openpyxl;       HAS_OPENPYXL = True
+except: HAS_OPENPYXL = False
+try:    import pandas as pd;   HAS_PANDAS   = True
+except: HAS_PANDAS   = False
+
+
+# ════════════════════════════════════════════════════════
+#  UTILITAIRES
+# ════════════════════════════════════════════════════════
+
+def install_package(pkg):
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except: return False
+
+def calculate_tva_fr(siren):
+    s = siren.strip()
+    if not s or not s.isdigit() or len(s) != 9: return ""
+    key = (12 + 3 * (int(s) % 97)) % 97
+    return f"FR{str(key).zfill(2)}{s}"
+
+def normalize_str(s):
+    s = s.upper().strip()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    for ch in [",",".","-","'",'"',"(",")"]: s = s.replace(ch," ")
+    return " ".join(s.split())
+
+def addr_similarity(a1, a2):
+    STOP = {"RUE","AV","AVE","AVENUE","BD","BOULEVARD","LE","LA","LES","DE","DU","DES","EN","ET","A","AU"}
+    w1 = set(normalize_str(a1).split()) - STOP or set(normalize_str(a1).split())
+    w2 = set(normalize_str(a2).split()) - STOP or set(normalize_str(a2).split())
+    if not w1 or not w2: return 0.0
+    return len(w1 & w2) / max(len(w1), len(w2))
+
+def make_record(**kw):
+    base = dict(code_sage="", intitule="", adresse="", complement="",
+                ville="", code_postal="", siren_base="", tva_base="",
+                siren_trouve="", tva_calcule="", adresse_trouvee="",
+                cp_trouve="", ville_trouvee="", score="", checked=False)
+    base.update(kw)
+    return base
+
+def csv_row_to_record(row):
+    MAP = {"code sage":"code_sage","code_sage":"code_sage",
+           "intitulé":"intitule","intitule":"intitule","adresse":"adresse",
+           "complément":"complement","complement":"complement","ville":"ville",
+           "code postal":"code_postal","code_postal":"code_postal"}
+    rec = make_record()
+    for k, v in row.items():
+        key = MAP.get(str(k).lower().strip())
+        if key: rec[key] = str(v).strip()
+    return rec
+
+
+# ════════════════════════════════════════════════════════
+#  PALETTE DESIGN — thème "dark slate"
+# ════════════════════════════════════════════════════════
+
+# Sidebar sombre + contenu clair/blanc épuré
+SB_BG     = "#1e2a3a"   # sidebar fond
+SB_HOVER  = "#2a3f56"
+SB_ACTIVE = "#3b82f6"   # bleu vif accent
+SB_TEXT   = "#94a3b8"
+SB_TEXT_A = "#f1f5f9"
+SB_DIVID  = "#2d3f52"
+
+C_BG      = "#f0f4f8"   # fond principal
+C_WHITE   = "#ffffff"
+C_PANEL   = "#ffffff"
+C_BORDER  = "#e2e8f0"
+C_TEXT    = "#1e293b"
+C_TEXT2   = "#64748b"
+C_ACCENT  = "#3b82f6"   # bleu accent
+C_ACCENT2 = "#0f172a"
+C_SUCCESS = "#22c55e"
+C_WARN    = "#f59e0b"
+C_DANGER  = "#ef4444"
+
+# Couleurs scores
+SC_100_BG, SC_100_FG = "#dcfce7", "#15803d"
+SC_70_BG,  SC_70_FG  = "#fef3c7", "#b45309"
+SC_50_BG,  SC_50_FG  = "#fee2e2", "#b91c1c"
+SC_0_BG,   SC_0_FG   = "#ffffff", "#334155"
+SC_ODD_BG             = "#f8fafc"
+
+# Colonnes : (id, label, width_px, key_dans_data, filtrable)
+COLUMNS = [
+    ("chk",   "✓",               38,  "checked",        False),
+    ("code",  "Code Sage",        90,  "code_sage",      True),
+    ("nom",   "Intitulé",        180,  "intitule",       True),
+    ("adr",   "Adresse",         155,  "adresse",        True),
+    ("cpl",   "Complément",       90,  "complement",     True),
+    ("vil",   "Ville",           110,  "ville",          True),
+    ("cp",    "CP",               60,  "code_postal",    True),
+    ("sir_b", "SIREN (base)",     92,  "siren_base",     True),
+    ("tva_b", "TVA (base)",       95,  "tva_base",       True),
+    ("sir_t", "SIREN trouvé",     92,  "siren_trouve",   True),
+    ("tva_c", "TVA calculé",      95,  "tva_calcule",    True),
+    ("adr_t", "Adresse trouvée", 155,  "adresse_trouvee",True),
+    ("cp_t",  "CP trouvé",        60,  "cp_trouve",      True),
+    ("vil_t", "Ville trouvée",   110,  "ville_trouvee",  True),
+    ("score", "Score",            52,  "score",          True),
+]
+
+
+# ════════════════════════════════════════════════════════
+#  WIDGETS CUSTOM
+# ════════════════════════════════════════════════════════
+
+class ModernButton(tk.Canvas):
+    """Bouton arrondi dessiné sur Canvas."""
+    def __init__(self, parent, text, command=None,
+                 bg=C_ACCENT, fg="white", hover=None,
+                 radius=8, font=("Segoe UI",9,"bold"),
+                 width=160, height=36, **kwargs):
+        super().__init__(parent, width=width, height=height,
+                         highlightthickness=0, bg=parent.cget("bg"), **kwargs)
+        self._bg      = bg
+        self._hover   = hover or self._darken(bg)
+        self._fg      = fg
+        self._text    = text
+        self._command = command
+        self._radius  = radius
+        self._font    = font
+        self._w       = width
+        self._h       = height
+        self._pressed = False
+        self._draw(bg)
+        self.bind("<Enter>",          lambda e: self._draw(self._hover))
+        self.bind("<Leave>",          lambda e: self._draw(self._bg))
+        self.bind("<ButtonPress-1>",  lambda e: self._on_press())
+        self.bind("<ButtonRelease-1>",lambda e: self._on_release())
+
+    def _darken(self, hex_color):
+        hex_color = hex_color.lstrip("#")
+        r,g,b = int(hex_color[0:2],16), int(hex_color[2:4],16), int(hex_color[4:6],16)
+        r,g,b = max(0,r-25), max(0,g-25), max(0,b-25)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw(self, color):
+        self.delete("all")
+        r, w, h = self._radius, self._w, self._h
+        self.create_arc(0,0,r*2,r*2, start=90, extent=90, fill=color, outline=color)
+        self.create_arc(w-r*2,0,w,r*2, start=0, extent=90, fill=color, outline=color)
+        self.create_arc(0,h-r*2,r*2,h, start=180, extent=90, fill=color, outline=color)
+        self.create_arc(w-r*2,h-r*2,w,h, start=270, extent=90, fill=color, outline=color)
+        self.create_rectangle(r,0,w-r,h, fill=color, outline=color)
+        self.create_rectangle(0,r,w,h-r, fill=color, outline=color)
+        self.create_text(w//2, h//2, text=self._text,
+                         fill=self._fg, font=self._font)
+
+    def _on_press(self):
+        self._pressed = True
+        self._draw(self._darken(self._hover))
+
+    def _on_release(self):
+        if self._pressed and self._command:
+            self._command()
+        self._pressed = False
+        self._draw(self._hover)
+
+    def config_text(self, text):
+        self._text = text
+        self._draw(self._bg)
+
+
+class SidebarButton(tk.Frame):
+    """Bouton de la sidebar avec icône + label."""
+    def __init__(self, parent, letter, label, command, is_active=False):
+        super().__init__(parent, bg=SB_ACTIVE if is_active else SB_BG,
+                         cursor="hand2")
+        self._cmd      = command
+        self._active   = is_active
+        self._normal   = SB_ACTIVE if is_active else SB_BG
+        self._lbl_text = label
+
+        inner = tk.Frame(self, bg=self["bg"])
+        inner.pack(fill=tk.X, padx=12, pady=6)
+
+        badge = tk.Label(inner, text=letter, width=2,
+                         bg=SB_ACTIVE if is_active else SB_HOVER,
+                         fg=SB_TEXT_A,
+                         font=("Segoe UI", 9, "bold"),
+                         relief="flat")
+        badge.pack(side=tk.LEFT, padx=(0,8))
+
+        lbl = tk.Label(inner, text=label,
+                       bg=self["bg"],
+                       fg=SB_TEXT_A if is_active else SB_TEXT,
+                       font=("Segoe UI", 9),
+                       anchor="w")
+        lbl.pack(side=tk.LEFT, fill=tk.X)
+
+        for w in [self, inner, badge, lbl]:
+            w.bind("<Button-1>", lambda e: self._cmd())
+            w.bind("<Enter>", self._on_enter)
+            w.bind("<Leave>", self._on_leave)
+
+    def _on_enter(self, e):
+        if not self._active:
+            for w in self.winfo_children() + [self]:
+                try: w.config(bg=SB_HOVER)
+                except: pass
+    def _on_leave(self, e):
+        if not self._active:
+            for w in self.winfo_children() + [self]:
+                try: w.config(bg=SB_BG)
+                except: pass
+
+
+# ════════════════════════════════════════════════════════
+#  APPLICATION PRINCIPALE
+# ════════════════════════════════════════════════════════
+
+class AideRFE:
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Aide RFE  –  Gestion tiers SIRENE")
+        self.root.geometry("1380x800")
+        self.root.minsize(1000, 620)
+        self.root.configure(bg=SB_BG)
+
+        self.data          = []
+        self.filtered_data = []
+        self.db_conn       = None
+        self.db_cfg        = {}
+        self._running      = False
+        self._sort_col     = None
+        self._sort_rev     = {}
+        self._col_filters  = {}   # {col_id: StringVar}
+        self.tree          = None  # initialisé dans _build_table
+
+        self._apply_styles()
+        self._build_ui()
+
+    # ────────────────────────────────────────────────────
+    #  STYLES
+    # ────────────────────────────────────────────────────
+    def _apply_styles(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+
+        # Treeview sans bordure avec couleurs custom
+        s.configure("Modern.Treeview",
+                    background=C_WHITE,
+                    fieldbackground=C_WHITE,
+                    foreground=C_TEXT,
+                    rowheight=26,
+                    font=("Segoe UI", 9),
+                    borderwidth=0,
+                    relief="flat")
+        s.configure("Modern.Treeview.Heading",
+                    background=C_BG,
+                    foreground=C_TEXT2,
+                    font=("Segoe UI", 9, "bold"),
+                    relief="flat",
+                    padding=(6, 6))
+        s.map("Modern.Treeview",
+              background=[("selected", "#dbeafe")],
+              foreground=[("selected", C_TEXT)])
+        s.map("Modern.Treeview.Heading",
+              background=[("active", C_BORDER)])
+
+        # Note: custom scrollbar layout removed for Python 3.14 compatibility
+        s.configure("TScrollbar",
+                    troughcolor=C_BG,
+                    background="#cbd5e1",
+                    arrowcolor="#2e5fa3")
+        s.configure("Progress.Horizontal.TProgressbar",
+                    troughcolor=C_BORDER,
+                    background=C_ACCENT,
+                    lightcolor=C_ACCENT,
+                    darkcolor=C_ACCENT,
+                    thickness=8)
+
+    # ────────────────────────────────────────────────────
+    #  CONSTRUCTION UI
+    # ────────────────────────────────────────────────────
+    def _build_ui(self):
+        # ══ Sidebar gauche ════════════════════════════
+        self.sidebar = tk.Frame(self.root, bg=SB_BG, width=210)
+        self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        self.sidebar.pack_propagate(False)
+        self._build_sidebar()
+
+        # ══ Séparateur vertical ═══════════════════════
+        sep = tk.Frame(self.root, bg=SB_DIVID, width=1)
+        sep.pack(side=tk.LEFT, fill=tk.Y)
+
+        # ══ Zone principale droite ════════════════════
+        self.main = tk.Frame(self.root, bg=C_BG)
+        self.main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._build_main()
+
+    # ── Sidebar ──────────────────────────────────────
+    def _build_sidebar(self):
+        sb = self.sidebar
+
+        # Logo / titre
+        logo_frm = tk.Frame(sb, bg=SB_BG)
+        logo_frm.pack(fill=tk.X, pady=(20, 8), padx=14)
+        tk.Label(logo_frm, text="⬡  AIDE RFE",
+                 bg=SB_BG, fg=SB_TEXT_A,
+                 font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        tk.Label(logo_frm, text="Gestion tiers Sage / SIRENE",
+                 bg=SB_BG, fg=SB_TEXT,
+                 font=("Segoe UI", 7)).pack(anchor="w")
+
+        # Divider
+        tk.Frame(sb, bg=SB_DIVID, height=1).pack(fill=tk.X, padx=14, pady=10)
+
+        # Boutons A-E
+        section_lbl = tk.Label(sb, text="ACTIONS",
+                                bg=SB_BG, fg="#4a6580",
+                                font=("Segoe UI", 7, "bold"))
+        section_lbl.pack(anchor="w", padx=16, pady=(4,4))
+
+        actions = [
+            ("A", "Connexion Sage",      self.btn_connexion),
+            ("B", "Export modèle CSV",   self.btn_export_exemple),
+            ("C", "Import CSV / Excel",  self.btn_import),
+            ("D", "Recherche SIRENE",    self.btn_recherche),
+            ("E", "Calculer N° TVA",     self.btn_calculer_tva),
+        ]
+        self._sb_btns = {}
+        for letter, label, cmd in actions:
+            btn = SidebarButton(sb, letter, label, cmd)
+            btn.pack(fill=tk.X, padx=6, pady=1)
+            self._sb_btns[letter] = btn
+
+        tk.Frame(sb, bg=SB_DIVID, height=1).pack(fill=tk.X, padx=14, pady=10)
+
+        section_lbl2 = tk.Label(sb, text="DONNÉES",
+                                 bg=SB_BG, fg="#4a6580",
+                                 font=("Segoe UI", 7, "bold"))
+        section_lbl2.pack(anchor="w", padx=16, pady=(4,4))
+
+        data_actions = [
+            ("G", "Mise à jour base",  self.btn_mise_a_jour),
+            ("I", "Export résultats",  self.btn_export_resultats),
+        ]
+        for letter, label, cmd in data_actions:
+            btn = SidebarButton(sb, letter, label, cmd)
+            btn.pack(fill=tk.X, padx=6, pady=1)
+
+        # Statut connexion (bas)
+        tk.Frame(sb, bg=SB_DIVID, height=1).pack(fill=tk.X, padx=14, pady=10)
+        self.lbl_conn = tk.Label(sb,
+            text="⚠  Non connecté",
+            bg=SB_BG, fg="#f87171",
+            font=("Segoe UI", 8), wraplength=180, justify="left")
+        self.lbl_conn.pack(anchor="w", padx=14, pady=4)
+
+        # Compteur en bas
+        self.lbl_count = tk.Label(sb, text="0 tiers chargés",
+                                   bg=SB_BG, fg=SB_TEXT,
+                                   font=("Segoe UI", 8))
+        self.lbl_count.pack(side=tk.BOTTOM, padx=14, pady=10, anchor="w")
+
+    # ── Zone principale ───────────────────────────────
+    def _build_main(self):
+        main = self.main
+
+        # ── Barre du haut : titre + barre globale filtre ──
+        topbar = tk.Frame(main, bg=C_WHITE,
+                          relief="flat", bd=0, height=54)
+        topbar.pack(fill=tk.X)
+        topbar.pack_propagate(False)
+        # Ombre portée simulée
+        tk.Frame(main, bg=C_BORDER, height=1).pack(fill=tk.X)
+
+        tb_inner = tk.Frame(topbar, bg=C_WHITE)
+        tb_inner.pack(fill=tk.BOTH, expand=True, padx=16)
+
+        tk.Label(tb_inner, text="Tiers Sage",
+                 bg=C_WHITE, fg=C_TEXT,
+                 font=("Segoe UI", 13, "bold")).pack(side=tk.LEFT, pady=14)
+
+        # Filtre global
+        filter_frm = tk.Frame(tb_inner, bg="#f1f5f9",
+                               relief="flat", bd=0)
+        filter_frm.pack(side=tk.LEFT, padx=24, pady=12, ipady=2)
+        tk.Label(filter_frm, text="  🔍  ", bg="#f1f5f9",
+                 fg=C_TEXT2, font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        self.var_global_filter = tk.StringVar()
+        self.var_global_filter.trace_add("write",
+                                          lambda *_: self.refresh_table())
+        entry = tk.Entry(filter_frm, textvariable=self.var_global_filter,
+                         bg="#f1f5f9", relief="flat",
+                         font=("Segoe UI", 9), fg=C_TEXT,
+                         insertbackground=C_TEXT, width=30)
+        entry.pack(side=tk.LEFT, ipady=4, padx=4)
+        entry.insert(0, "Rechercher dans tous les champs…")
+        entry.config(fg=C_TEXT2)
+        entry.bind("<FocusIn>",  lambda e: (
+            entry.delete(0,tk.END), entry.config(fg=C_TEXT))
+            if entry.get()=="Rechercher dans tous les champs…" else None)
+        entry.bind("<FocusOut>", lambda e: (
+            entry.insert(0,"Rechercher dans tous les champs…"),
+            entry.config(fg=C_TEXT2))
+            if not entry.get() else None)
+
+        # Options droite
+        right_tb = tk.Frame(tb_inner, bg=C_WHITE)
+        right_tb.pack(side=tk.RIGHT, pady=10)
+
+        self.var_show_all = tk.BooleanVar(value=False)
+        cb = tk.Checkbutton(right_tb,
+                             text="Afficher enregistrements complets",
+                             variable=self.var_show_all,
+                             command=self.refresh_table,
+                             bg=C_WHITE, fg=C_TEXT2,
+                             activebackground=C_WHITE,
+                             font=("Segoe UI", 8),
+                             selectcolor=C_WHITE,
+                             cursor="hand2")
+        cb.pack(side=tk.LEFT, padx=8)
+
+        tk.Button(right_tb, text="☑  Tout cocher",
+                  command=self.check_all,
+                  bg=C_BG, fg=C_TEXT2,
+                  activebackground=C_BORDER,
+                  font=("Segoe UI", 8), relief="flat",
+                  padx=10, pady=4, cursor="hand2",
+                  bd=1).pack(side=tk.LEFT, padx=2)
+
+        tk.Button(right_tb, text="☐  Tout décocher",
+                  command=self.uncheck_all,
+                  bg=C_BG, fg=C_TEXT2,
+                  activebackground=C_BORDER,
+                  font=("Segoe UI", 8), relief="flat",
+                  padx=10, pady=4, cursor="hand2",
+                  bd=1).pack(side=tk.LEFT, padx=2)
+
+        # ── Table zone ────────────────────────────────
+        tbl_container = tk.Frame(main, bg=C_BG)
+        tbl_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8,0))
+
+        self._build_table(tbl_container)
+
+        # ── Barre du bas : progression ─────────────────
+        self._build_bottombar(main)
+
+    # ── Table avec filtres par colonne ────────────────
+    def _build_table(self, parent):
+        # Conteneur blanc avec légère ombre
+        card = tk.Frame(parent, bg=C_WHITE,
+                        relief="flat", bd=0)
+        card.pack(fill=tk.BOTH, expand=True)
+        tk.Frame(card, bg=C_BORDER, height=1).pack(fill=tk.X)
+
+        # Frame pour scrollbars
+        tree_frame = tk.Frame(card, bg=C_WHITE)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical")
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal")
+        vsb.pack(side=tk.RIGHT,  fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        col_ids = [c[0] for c in COLUMNS]
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=col_ids,
+            show="headings",
+            style="Modern.Treeview",
+            yscrollcommand=vsb.set,
+            xscrollcommand=hsb.set)
+        vsb.config(command=self.tree.yview)
+        hsb.config(command=self.tree.xview)
+
+        # Configuration des colonnes
+        for cid, label, width, key, filtrable in COLUMNS:
+            sort_arrow = ""
+            self.tree.heading(
+                cid,
+                text=f"{label} {sort_arrow}",
+                command=lambda c=cid: self._sort_by(c),
+                anchor="w")
+            anchor = "center" if cid in ("chk","score") else "w"
+            stretch = cid == "nom"   # seul l'intitulé s'étire
+            self.tree.column(cid,
+                              width=width,
+                              minwidth=max(30, width//2),
+                              stretch=stretch,
+                              anchor=anchor)
+
+        # Tags couleur
+        self.tree.tag_configure("sc_100", background=SC_100_BG, foreground=SC_100_FG)
+        self.tree.tag_configure("sc_70",  background=SC_70_BG,  foreground=SC_70_FG)
+        self.tree.tag_configure("sc_50",  background=SC_50_BG,  foreground=SC_50_FG)
+        self.tree.tag_configure("sc_0",   background=SC_0_BG,   foreground=SC_0_FG)
+        self.tree.tag_configure("odd",    background=SC_ODD_BG)
+        self.tree.tag_configure("even",   background=C_WHITE)
+
+        self.tree.pack(fill=tk.BOTH, expand=True)
+        self.tree.bind("<ButtonRelease-1>", self._on_click)
+
+        # ── LIGNE DE FILTRES PAR COLONNE ──────────────
+        # Placée dans un frame séparé SOUS la table (layout plus simple et fiable)
+        filter_bar = tk.Frame(card, bg=C_BG)
+        filter_bar.pack(fill=tk.X)
+        tk.Frame(filter_bar, bg=C_BORDER, height=1).pack(fill=tk.X)
+
+        filter_inner = tk.Frame(filter_bar, bg=C_BG)
+        filter_inner.pack(fill=tk.X, padx=0, pady=4)
+
+        tk.Label(filter_inner, text=" ▼ Filtres par colonne :",
+                 bg=C_BG, fg=C_TEXT2,
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(8,4))
+
+        self._col_filters = {}
+        scroll_area = tk.Frame(filter_inner, bg=C_BG)
+        scroll_area.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        for cid, label, width, key, filtrable in COLUMNS:
+            if not filtrable:
+                continue
+            col_frm = tk.Frame(scroll_area, bg=C_BG)
+            col_frm.pack(side=tk.LEFT, padx=2)
+
+            tk.Label(col_frm, text=label[:8] + ("…" if len(label)>8 else ""),
+                     bg=C_BG, fg=C_TEXT2,
+                     font=("Segoe UI", 7)).pack(anchor="w")
+
+            var = tk.StringVar()
+            var.trace_add("write", lambda *_, v=var, k=key: self._apply_filters())
+            self._col_filters[key] = var
+
+            entry = tk.Entry(col_frm, textvariable=var,
+                             width=max(6, width//9),
+                             bg=C_WHITE, fg=C_TEXT,
+                             relief="solid", bd=1,
+                             font=("Segoe UI", 8),
+                             insertbackground=C_TEXT)
+            entry.pack(ipady=2)
+
+        tk.Button(filter_inner, text="✕ Effacer",
+                  command=self._clear_filters,
+                  bg=C_BG, fg=C_DANGER,
+                  activebackground="#fee2e2",
+                  font=("Segoe UI", 8), relief="flat",
+                  cursor="hand2", padx=6).pack(side=tk.RIGHT, padx=8)
+
+    # ── Barre du bas ──────────────────────────────────
+    def _build_bottombar(self, parent):
+        bar = tk.Frame(parent, bg=C_WHITE, height=52)
+        bar.pack(fill=tk.X, side=tk.BOTTOM)
+        bar.pack_propagate(False)
+        tk.Frame(bar, bg=C_BORDER, height=1).pack(fill=tk.X)
+
+        inner = tk.Frame(bar, bg=C_WHITE)
+        inner.pack(fill=tk.BOTH, expand=True, padx=16)
+        inner.grid_columnconfigure(1, weight=1)
+
+        # Progression (H)
+        prog_frm = tk.Frame(inner, bg=C_WHITE)
+        prog_frm.grid(row=0, column=1, sticky="ew", padx=20, pady=8)
+
+        self.var_prog = tk.DoubleVar()
+        self.progress = ttk.Progressbar(
+            prog_frm, variable=self.var_prog,
+            maximum=100,
+            style="Progress.Horizontal.TProgressbar")
+        self.progress.pack(fill=tk.X)
+
+        self.lbl_prog = tk.Label(prog_frm, text="",
+                                  bg=C_WHITE, fg=C_TEXT2,
+                                  font=("Segoe UI", 7))
+        self.lbl_prog.pack(pady=(1,0))
+
+        # Statut gauche
+        self.var_status = tk.StringVar(value="Prêt.")
+        tk.Label(inner, textvariable=self.var_status,
+                 bg=C_WHITE, fg=C_TEXT2,
+                 font=("Segoe UI", 8),
+                 anchor="w").grid(row=0, column=0, sticky="w", pady=8)
+
+
+    # ════════════════════════════════════════════════════════
+    #  A  CONNEXION SAGE
+    # ════════════════════════════════════════════════════════
+
+    def btn_connexion(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Connexion Sage")
+        dlg.geometry("460x380")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.configure(bg=C_WHITE)
+
+        # Header
+        hdr = tk.Frame(dlg, bg=SB_BG, height=50)
+        hdr.pack(fill=tk.X); hdr.pack_propagate(False)
+        tk.Label(hdr, text="Connexion SQL Server – Base Sage",
+                 bg=SB_BG, fg=SB_TEXT_A,
+                 font=("Segoe UI", 11, "bold")).pack(expand=True)
+
+        body = tk.Frame(dlg, bg=C_WHITE)
+        body.pack(fill=tk.BOTH, expand=True, padx=28, pady=14)
+
+        entries = {}
+        fields = [("Serveur\\Instance :", "server",   "localhost", False),
+                  ("Base de données :",   "database", "",          False),
+                  ("Utilisateur :",       "username", "",          False),
+                  ("Mot de passe :",      "password", "",          True)]
+        for lbl_txt, key, default, secret in fields:
+            row = tk.Frame(body, bg=C_WHITE)
+            row.pack(fill=tk.X, pady=5)
+            tk.Label(row, text=lbl_txt, width=22, anchor="w",
+                     bg=C_WHITE, fg=C_TEXT,
+                     font=("Segoe UI", 9)).pack(side=tk.LEFT)
+            e = tk.Entry(row, show="•" if secret else "",
+                         relief="solid", bd=1, width=26,
+                         font=("Segoe UI", 9), bg=C_BG)
+            if default: e.insert(0, default)
+            e.pack(side=tk.LEFT)
+            entries[key] = e
+
+        win_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(body, text="Authentification Windows",
+                       variable=win_var, bg=C_WHITE, fg=C_TEXT,
+                       activebackground=C_WHITE,
+                       font=("Segoe UI", 9),
+                       selectcolor=C_BG).pack(anchor="w", pady=4)
+
+        if not HAS_PYODBC:
+            warn = tk.Frame(body, bg="#fef3c7", relief="solid", bd=1)
+            warn.pack(fill=tk.X, pady=4)
+            tk.Label(warn, text="⚠  pyodbc non installé",
+                     bg="#fef3c7", fg="#92400e",
+                     font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=6, pady=4)
+            tk.Button(warn, text="Installer",
+                      command=lambda: self._install_dep(dlg, "pyodbc"),
+                      bg="#f59e0b", fg="white", relief="flat",
+                      font=("Segoe UI", 8)).pack(side=tk.RIGHT, padx=6)
+
+        lbl_st = tk.Label(body, text="", bg=C_WHITE, fg=C_TEXT2,
+                           font=("Segoe UI", 8))
+        lbl_st.pack(pady=4)
+
+        def do_connect():
+            self.db_cfg = {"server": entries["server"].get().strip(),
+                           "database": entries["database"].get().strip(),
+                           "username": entries["username"].get().strip(),
+                           "password": entries["password"].get(),
+                           "win_auth": win_var.get()}
+            lbl_st.config(text="⏳ Connexion en cours…", fg=C_TEXT2)
+            dlg.update()
+            ok, msg = self._connect_db()
+            if ok:
+                lbl_st.config(text="✓ Connecté !", fg=C_SUCCESS)
+                dlg.update()
+                self._load_from_db()
+                dlg.destroy()
+            else:
+                lbl_st.config(text=f"❌ {msg}", fg=C_DANGER)
+
+        ModernButton(body, "  Se connecter  ", command=do_connect,
+                     bg=C_ACCENT, fg="white", width=170, height=36).pack(pady=8)
+
+    def _install_dep(self, parent_dlg, pkg):
+        parent_dlg.destroy()
+        if install_package(pkg):
+            messagebox.showinfo("Succès", f"{pkg} installé.\nRedémarrez l'application.")
+        else:
+            messagebox.showerror("Erreur", f"Lancez manuellement : pip install {pkg}")
+
+    def _connect_db(self):
+        try:
+            import importlib
+            mod = importlib.import_module("pyodbc")
+        except ImportError:
+            return False, "pyodbc non disponible."
+        cfg = self.db_cfg
+        drivers = [d for d in mod.drivers() if "SQL Server" in d]
+        preferred = [d for d in drivers if any(v in d for v in ("17","18","19"))]
+        driver = (preferred or drivers or ["SQL Server"])[0] if drivers else "SQL Server"
+        cs = (f"DRIVER={{{driver}}};SERVER={cfg['server']};"
+              f"DATABASE={cfg['database']};" +
+              ("Trusted_Connection=yes;" if cfg["win_auth"] else
+               f"UID={cfg['username']};PWD={cfg['password']};"))
+        try:
+            self.db_conn = mod.connect(cs, timeout=15)
+            return True, "OK"
+        except Exception as e:
+            return False, str(e)
+
+    def _load_from_db(self):
+        if not self.db_conn: return
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("""
+                SELECT CT_Num, CT_Intitule, CT_Adresse, CT_Complement,
+                       CT_Ville, CT_CodePostal, CT_Siren, CT_NumPaysTVA
+                FROM F_COMPTET ORDER BY CT_Intitule""")
+            self.data = []
+            for row in cursor.fetchall():
+                self.data.append(make_record(
+                    code_sage=str(row[0] or "").strip(),
+                    intitule=str(row[1] or "").strip(),
+                    adresse=str(row[2] or "").strip(),
+                    complement=str(row[3] or "").strip(),
+                    ville=str(row[4] or "").strip(),
+                    code_postal=str(row[5] or "").strip(),
+                    siren_base=str(row[6] or "").strip(),
+                    tva_base=str(row[7] or "").strip()))
+            self._update_conn_status()
+            self.refresh_table()
+        except Exception as e:
+            messagebox.showerror("Erreur SQL", str(e))
+
+    def _update_conn_status(self):
+        n = len(self.data)
+        self.lbl_conn.config(
+            text=f"✓  {self.db_cfg.get('database','')}\n{n} tiers chargés",
+            fg="#4ade80")
+        self.lbl_count.config(text=f"{n} tiers chargés")
+
+    # ════════════════════════════════════════════════════════
+    #  B  EXPORT MODÈLE
+    # ════════════════════════════════════════════════════════
+
+    def btn_export_exemple(self):
+        path = filedialog.asksaveasfilename(
+            title="Enregistrer le modèle",
+            defaultextension=".csv",
+            filetypes=[("CSV (;)", "*.csv"), ("Excel", "*.xlsx")])
+        if not path: return
+        headers = ["Code sage","Intitulé","Adresse","Complément","Ville","Code Postal"]
+        exemple = [["CLI001","Exemple SARL","12 rue de la Paix","Bâtiment A","Paris","75001"],
+                   ["CLI002","Test SAS","5 avenue Foch","","Lyon","69001"]]
+        if path.lower().endswith(".xlsx"):
+            if not self._ensure_openpyxl(): return
+            import openpyxl as xl; from openpyxl.styles import PatternFill, Font
+            wb = xl.Workbook(); ws = wb.active; ws.title = "Modèle"
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.font = Font(bold=True); cell.fill = PatternFill("solid", fgColor="3B82F6")
+                cell.font = Font(bold=True, color="FFFFFF")
+            for r in exemple: ws.append(r)
+            wb.save(path)
+        else:
+            with open(path,"w",newline="",encoding="utf-8-sig") as f:
+                csv.writer(f, delimiter=";").writerows([headers]+exemple)
+        messagebox.showinfo("Modèle exporté", f"Fichier créé :\n{path}")
+
+    # ════════════════════════════════════════════════════════
+    #  C  IMPORT CSV / EXCEL
+    # ════════════════════════════════════════════════════════
+
+    def btn_import(self):
+        path = filedialog.askopenfilename(
+            title="Importer",
+            filetypes=[("CSV","*.csv"),("Excel","*.xlsx *.xls"),("Tous","*.*")])
+        if not path: return
+        try:
+            records = self._parse_file(path)
+        except Exception as e:
+            messagebox.showerror("Erreur import", str(e)); return
+        if not records:
+            messagebox.showwarning("Import","Aucune ligne lue."); return
+
+        if self.data:
+            rep = messagebox.askyesnocancel(
+                "Import",
+                f"{len(records)} enregistrements lus.\n\n"
+                "Oui = Fusionner  |  Non = Remplacer  |  Annuler")
+            if rep is None: return
+            if rep:
+                idx = {r["code_sage"]: r for r in self.data}
+                for rec in records:
+                    if rec["code_sage"] in idx:
+                        idx[rec["code_sage"]].update(
+                            {k:rec[k] for k in ("intitule","adresse","complement","ville","code_postal")})
+                    else: self.data.append(rec)
+            else: self.data = records
+        else:
+            self.data = records
+
+        self.lbl_count.config(text=f"{len(self.data)} tiers chargés")
+        self.refresh_table()
+        self._status(f"{len(records)} enregistrements importés — {os.path.basename(path)}")
+        messagebox.showinfo("Import réussi", f"{len(records)} enregistrements chargés.")
+
+    def _parse_file(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        records = []
+        if ext == ".csv":
+            with open(path,"r",encoding="utf-8-sig",errors="replace") as f:
+                sample = f.read(8192); f.seek(0)
+                sep = ";" if sample.count(";") >= sample.count(",") else ","
+                for row in csv.DictReader(f, delimiter=sep):
+                    records.append(csv_row_to_record(row))
+        elif ext in (".xlsx",".xls"):
+            if HAS_PANDAS:
+                for _, row in pd.read_excel(path, dtype=str).fillna("").iterrows():
+                    records.append(csv_row_to_record(dict(row)))
+            elif HAS_OPENPYXL:
+                import openpyxl as xl
+                wb = xl.load_workbook(path, data_only=True); ws = wb.active
+                hdrs = [str(c.value or "").strip() for c in next(ws.iter_rows(max_row=1))]
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    records.append(csv_row_to_record(dict(zip(hdrs,[str(v or "").strip() for v in row]))))
+            else:
+                raise RuntimeError("pandas ou openpyxl requis pour Excel.\npip install openpyxl")
+        else:
+            raise ValueError(f"Format non supporté : {ext}")
+        return records
+
+    # ════════════════════════════════════════════════════════
+    #  D  RECHERCHE SIRENE
+    # ════════════════════════════════════════════════════════
+
+    def btn_recherche(self):
+        if not self.data:
+            messagebox.showwarning("Recherche","Aucune donnée chargée."); return
+        if self._running:
+            messagebox.showwarning("Recherche","Recherche déjà en cours."); return
+        todo = [r for r in self.data if r.get("checked")]
+        if not todo:
+            messagebox.showwarning("Recherche","Cochez les tiers à rechercher."); return
+        if not messagebox.askyesno("Recherche SIRENE",
+                f"Lancer pour {len(todo)} tiers ?\n(délai 0,4 s / appel API)"): return
+        self._running = True
+        threading.Thread(target=self._search_thread, args=(todo,), daemon=True).start()
+
+    def _search_thread(self, records):
+        n = len(records)
+        self._prog(0, f"0 / {n}")
+        for i, rec in enumerate(records):
+            try: self._sirene_lookup(rec)
+            except: rec["siren_trouve"]="erreur"; rec["score"]="0"
+            self._prog((i+1)/n*100, f"{i+1} / {n}  —  {rec.get('intitule','')[:50]}")
+            time.sleep(0.4)
+        self._running = False
+        self.root.after(0, self.refresh_table)
+        self._status(f"Recherche terminée — {n} tiers traités")
+
+    def _sirene_lookup(self, rec):
+        intitule = rec.get("intitule","").strip()
+        adresse  = rec.get("adresse","").strip()
+        ville    = rec.get("ville","").strip()
+        cp       = rec.get("code_postal","").strip()
+        if not intitule and not adresse:
+            rec.update(siren_trouve="non trouvé",score="0"); return
+        params = {"per_page":"10","q": intitule}
+        if cp: params["code_postal"] = cp
+        try:
+            resp = requests.get("https://recherche-entreprises.api.gouv.fr/search",
+                                params=params, timeout=8)
+        except requests.Timeout:
+            rec.update(siren_trouve="timeout",score="0"); return
+        except:
+            rec.update(siren_trouve="erreur réseau",score="0"); return
+        if resp.status_code != 200:
+            rec.update(siren_trouve="non trouvé",score="0"); return
+        results = resp.json().get("results",[])
+        if not results:
+            rec.update(siren_trouve="non trouvé",score="0",
+                       adresse_trouvee="",cp_trouve="",ville_trouvee=""); return
+        best_score, best = 0, None
+        for r in results:
+            siege  = r.get("siege",{}) or {}
+            r_adr  = " ".join(filter(None,[
+                str(siege.get("numero_voie","") or "").strip(),
+                str(siege.get("type_voie","")   or "").strip(),
+                str(siege.get("libelle_voie","") or "").strip()]))
+            r_cp   = str(siege.get("code_postal","")     or "").strip()
+            r_vil  = str(siege.get("libelle_commune","") or "").strip()
+            nom_r  = r.get("nom_raison_sociale","") or ""
+            nom_ok = (normalize_str(intitule) in normalize_str(nom_r) or
+                      normalize_str(nom_r) in normalize_str(intitule))
+            adr_ok = addr_similarity(adresse, r_adr) > 0.45
+            cp_ok  = (cp == r_cp)
+            vil_ok = (normalize_str(ville) in normalize_str(r_vil) or
+                      normalize_str(r_vil) in normalize_str(ville))
+            sc = (100 if nom_ok and adr_ok and (cp_ok or vil_ok)
+                  else 70 if adr_ok and cp_ok and vil_ok
+                  else 50 if nom_ok else 0)
+            if sc > best_score:
+                best_score = sc
+                best = dict(siren=r.get("siren",""),adresse=r_adr,cp=r_cp,ville=r_vil)
+        if best and best_score > 0:
+            rec.update(siren_trouve=best["siren"],score=str(best_score),
+                       adresse_trouvee=best["adresse"],
+                       cp_trouve=best["cp"],ville_trouvee=best["ville"])
+        else:
+            rec.update(siren_trouve="non trouvé",score="0",
+                       adresse_trouvee="",cp_trouve="",ville_trouvee="")
+
+    # ════════════════════════════════════════════════════════
+    #  E  CALCULER TVA
+    # ════════════════════════════════════════════════════════
+
+    def btn_calculer_tva(self):
+        n = 0
+        for rec in self.data:
+            s = rec.get("siren_trouve","").strip()
+            if not (s and s.isdigit() and len(s)==9):
+                s = rec.get("siren_base","").strip()
+            tva = calculate_tva_fr(s)
+            if tva: rec["tva_calcule"] = tva; n += 1
+        self.refresh_table()
+        messagebox.showinfo("TVA calculée",
+            f"N° TVA calculés pour {n} tiers.\n\n"
+            "Formule : clé = (12 + 3 × SIREN mod 97) mod 97\n"
+            "          N° TVA = FR + clé(2 chiffres) + SIREN")
+
+    # ════════════════════════════════════════════════════════
+    #  TABLE – AFFICHAGE ET INTERACTIONS
+    # ════════════════════════════════════════════════════════
+
+    def _get_display_data(self):
+        """Retourne les données après application de tous les filtres."""
+        show_all    = self.var_show_all.get()
+        global_flt  = self.var_global_filter.get().lower()
+        # Ignorer le placeholder
+        if global_flt == "rechercher dans tous les champs…":
+            global_flt = ""
+
+        result = []
+        for rec in self.data:
+            # Filtre enregistrements complets
+            if not show_all and self._is_complete(rec):
+                continue
+            # Filtre global
+            if global_flt:
+                all_vals = " ".join(str(v) for v in rec.values()).lower()
+                if global_flt not in all_vals:
+                    continue
+            # Filtres par colonne
+            match = True
+            for key, var in self._col_filters.items():
+                flt = var.get().lower().strip()
+                if flt and flt not in str(rec.get(key,"")).lower():
+                    match = False; break
+            if match:
+                result.append(rec)
+        return result
+
+    def refresh_table(self):
+        if self.tree is None:
+            return
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        rows = self._get_display_data()
+        for i, rec in enumerate(rows):
+            score = rec.get("score","")
+            if score == "100":  tag = "sc_100"
+            elif score == "70": tag = "sc_70"
+            elif score == "50": tag = "sc_50"
+            elif score == "0" and rec.get("siren_trouve",""):
+                tag = "sc_0"
+            else:
+                tag = "odd" if i % 2 else "even"
+
+            chk = "☑" if rec.get("checked") else "☐"
+            values = [chk,
+                rec.get("code_sage",""), rec.get("intitule",""),
+                rec.get("adresse",""),   rec.get("complement",""),
+                rec.get("ville",""),     rec.get("code_postal",""),
+                rec.get("siren_base",""),rec.get("tva_base",""),
+                rec.get("siren_trouve",""),rec.get("tva_calcule",""),
+                rec.get("adresse_trouvee",""),rec.get("cp_trouve",""),
+                rec.get("ville_trouvee",""), score]
+            iid = rec.get("code_sage") or str(id(rec))
+            self.tree.insert("", tk.END, iid=iid, values=values, tags=(tag,))
+
+        # Mettre à jour le compteur
+        total = len(self.data)
+        shown = len(rows)
+        self._status(f"{shown} tiers affichés sur {total}")
+
+    def _apply_filters(self):
+        if self.tree is None:
+            return
+        self.refresh_table()
+
+    def _clear_filters(self):
+        for var in self._col_filters.values():
+            var.set("")
+        self.var_global_filter.set("")
+        self.refresh_table()
+
+    @staticmethod
+    def _is_complete(rec):
+        return all(rec.get(k) for k in
+                   ("siren_base","tva_base","intitule","adresse","ville","code_postal"))
+
+    def _on_click(self, event):
+        if self.tree.identify_region(event.x, event.y) != "cell": return
+        if self.tree.identify_column(event.x) != "#1": return
+        item = self.tree.identify_row(event.y)
+        if not item: return
+        for rec in self.data:
+            if (rec.get("code_sage") or str(id(rec))) == item:
+                rec["checked"] = not rec.get("checked", False)
+                break
+        self.refresh_table()
+
+    def check_all(self):
+        show_all   = self.var_show_all.get()
+        global_flt = self.var_global_filter.get().lower()
+        if global_flt == "rechercher dans tous les champs…": global_flt = ""
+        for rec in self._get_display_data():
+            rec["checked"] = True
+        self.refresh_table()
+
+    def uncheck_all(self):
+        for rec in self.data: rec["checked"] = False
+        self.refresh_table()
+
+    def _sort_by(self, col_id):
+        if col_id == "chk": return
+        key  = next((c[3] for c in COLUMNS if c[0] == col_id), col_id)
+        rev  = self._sort_rev.get(col_id, False)
+        self.data.sort(key=lambda r: str(r.get(key,"")).lower(), reverse=rev)
+        self._sort_rev[col_id] = not rev
+
+        # Mettre à jour les flèches dans les entêtes
+        for cid, label, *_ in COLUMNS:
+            arrow = ""
+            if cid == col_id:
+                arrow = " ↑" if not rev else " ↓"
+            self.tree.heading(cid, text=label + arrow)
+        self.refresh_table()
+
+    # ════════════════════════════════════════════════════════
+    #  G  MISE À JOUR BASE
+    # ════════════════════════════════════════════════════════
+
+    def btn_mise_a_jour(self):
+        if not self.db_conn:
+            messagebox.showerror("Erreur","Non connecté. Utilisez le bouton A."); return
+        INVALID = ("non trouvé","erreur","erreur réseau","timeout","")
+        todo = [r for r in self.data
+                if r.get("checked") and r.get("siren_trouve") not in INVALID]
+        if not todo:
+            messagebox.showwarning("Mise à jour",
+                "Aucun tiers coché avec SIREN trouvé.\nLancez d'abord Recherche (D)."); return
+        if not messagebox.askyesno("Mise à jour SQL",
+                f"Mettre à jour {len(todo)} tiers dans F_COMPTET ?\n\n"
+                "CT_Siren, CT_NumPaysTVA, CT_Adresse, CT_CodePostal, CT_Ville\n\n"
+                "Seules les cases cochées sont mises à jour."): return
+        threading.Thread(target=self._update_thread, args=(todo,), daemon=True).start()
+
+    def _update_thread(self, records):
+        n, errors = len(records), 0
+        self._prog(0, f"0 / {n}")
+        try:
+            cursor = self.db_conn.cursor()
+            for i, rec in enumerate(records):
+                try:
+                    pairs = [("CT_Siren","siren_trouve"),("CT_NumPaysTVA","tva_calcule"),
+                             ("CT_Adresse","adresse_trouvee"),("CT_CodePostal","cp_trouve"),
+                             ("CT_Ville","ville_trouvee")]
+                    sets, params = [], []
+                    for col, key in pairs:
+                        v = rec.get(key,"").strip()
+                        if v: sets.append(f"{col} = ?"); params.append(v)
+                    if sets:
+                        params.append(rec["code_sage"])
+                        cursor.execute(f"UPDATE F_COMPTET SET {', '.join(sets)} WHERE CT_Num = ?", params)
+                except: errors += 1
+                self._prog((i+1)/n*100, f"{i+1} / {n}")
+                time.sleep(0.05)
+            self.db_conn.commit()
+            msg = f"Mise à jour : {n-errors} succès, {errors} erreur(s)."
+            self.root.after(0, lambda m=msg: messagebox.showinfo("Mise à jour", m))
+            self._status(msg)
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Erreur SQL", str(e)))
+
+    # ════════════════════════════════════════════════════════
+    #  I  EXPORT RÉSULTATS
+    # ════════════════════════════════════════════════════════
+
+    def btn_export_resultats(self):
+        if not self.data:
+            messagebox.showwarning("Export","Aucune donnée."); return
+        path = filedialog.asksaveasfilename(
+            title="Exporter les résultats",
+            defaultextension=".xlsx",
+            filetypes=[("Excel","*.xlsx"),("CSV (;)","*.csv")])
+        if not path: return
+        HDRS = ["Code Sage","Intitulé","Adresse","Complément","Ville","Code Postal",
+                "SIREN (base)","TVA (base)","SIREN trouvé","TVA calculé",
+                "Adresse trouvée","CP trouvé","Ville trouvée","Score"]
+        KEYS = ["code_sage","intitule","adresse","complement","ville","code_postal",
+                "siren_base","tva_base","siren_trouve","tva_calcule",
+                "adresse_trouvee","cp_trouve","ville_trouvee","score"]
+        rows = [[r.get(k,"") for k in KEYS] for r in self.data]
+        if path.lower().endswith(".xlsx"):
+            if not self._ensure_openpyxl(): return
+            import openpyxl as xl; from openpyxl.styles import PatternFill, Font
+            wb = xl.Workbook(); ws = wb.active; ws.title = "Résultats SIRENE"
+            ws.append(HDRS)
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1E2A3A")
+            CXLS = {"100":"DCFCE7","70":"FEF3C7","50":"FEE2E2"}
+            for row_data, rec in zip(rows, self.data):
+                ws.append(row_data)
+                sc = rec.get("score","")
+                if sc in CXLS:
+                    fill = PatternFill("solid", fgColor=CXLS[sc])
+                    for c in ws[ws.max_row]: c.fill = fill
+            for col in ws.iter_cols():
+                mx = max((len(str(c.value or "")) for c in col), default=8)
+                ws.column_dimensions[col[0].column_letter].width = min(mx+2, 40)
+            wb.save(path)
+        else:
+            with open(path,"w",newline="",encoding="utf-8-sig") as f:
+                w = csv.writer(f, delimiter=";")
+                w.writerow(HDRS); w.writerows(rows)
+        messagebox.showinfo("Export", f"Résultats exportés :\n{path}")
+
+    # ════════════════════════════════════════════════════════
+    #  HELPERS
+    # ════════════════════════════════════════════════════════
+
+    def _status(self, msg):
+        self.root.after(0, lambda: self.var_status.set(msg))
+
+    def _prog(self, pct, label=""):
+        def _do():
+            self.var_prog.set(pct)
+            self.lbl_prog.config(text=label)
+        self.root.after(0, _do)
+
+    def _ensure_openpyxl(self):
+        if HAS_OPENPYXL: return True
+        if messagebox.askyesno("openpyxl manquant",
+                "Installer openpyxl pour les fichiers Excel ?"):
+            if install_package("openpyxl"):
+                messagebox.showinfo("Succès","openpyxl installé. Redémarrez.")
+            else:
+                messagebox.showerror("Erreur","pip install openpyxl")
+        return False
+
+
+# ════════════════════════════════════════════════════════
+#  POINT D'ENTRÉE
+# ════════════════════════════════════════════════════════
+
+def main():
+    root = tk.Tk()
+    try: root.iconbitmap(default="")
+    except: pass
+    AideRFE(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
