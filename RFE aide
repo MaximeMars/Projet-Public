@@ -17,6 +17,20 @@ import tempfile
 import configparser
 import json
 
+# ════════════════════════════════════════════════════════
+#  RESSOURCES EMBARQUÉES  (dev + PyInstaller --onefile)
+# ════════════════════════════════════════════════════════
+
+def resource_path(relative):
+    """
+    Retourne le chemin absolu vers une ressource embarquée.
+    En développement : chemin relatif au script.
+    Après compilation PyInstaller : chemin dans le dossier temporaire _MEIPASS.
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
 # ── Dépendances optionnelles ────────────────────────────────
 try:    import pyodbc;         HAS_PYODBC   = True
 except: HAS_PYODBC   = False
@@ -43,6 +57,19 @@ def calculate_tva_fr(siren):
     key = (12 + 3 * (int(s) % 97)) % 97
     return f"FR{str(key).zfill(2)}{s}"
 
+def clean_cp(s):
+    """Extrait un code postal à 5 chiffres depuis une chaîne quelconque."""
+    import re as _re
+    m = _re.search(r'\b(\d{5})\b', s)
+    return m.group(1) if m else ""
+
+def clean_ville(s):
+    """Supprime 'cedex', numéros d'arrondissement parasites, etc."""
+    import re as _re
+    s = _re.sub(r'(?i)\bcedex\b\s*\d*', '', s)
+    s = _re.sub(r'\s+', ' ', s)
+    return s.strip()
+
 def normalize_str(s):
     s = s.upper().strip()
     s = unicodedata.normalize("NFD", s)
@@ -61,7 +88,7 @@ def addr_similarity(a1, a2):
 def make_record(**kw):
     base = dict(code_sage="", intitule="", adresse="", complement="",
                 ville="", code_postal="", siren_base="", tva_base="",
-                siren_trouve="", tva_calcule="", adresse_trouvee="",
+                siren_trouve="", siret_trouve="", tva_calcule="", adresse_trouvee="",
                 cp_trouve="", ville_trouvee="", score="",
                 tva_statut="",        # résultat contrôle VIES : ✅/❌/⚠/…
                 suggestions=[],       # liste de dicts {siren, nom, adresse, cp, ville, tva}
@@ -71,15 +98,90 @@ def make_record(**kw):
     return base
 
 def csv_row_to_record(row):
-    MAP = {"code sage":"code_sage","code_sage":"code_sage","code tiers":"code_sage","code_tiers":"code_sage",
-           "intitulé":"intitule","intitule":"intitule","adresse":"adresse",
-           "complément":"complement","complement":"complement","ville":"ville",
-           "code postal":"code_postal","code_postal":"code_postal"}
+    # Normaliser une clé : minuscules, sans accents, sans tirets/underscores
+    def _nk(s):
+        import unicodedata as _ud
+        s = str(s).lower().strip()
+        s = _ud.normalize("NFD", s)
+        s = "".join(c for c in s if _ud.category(c) != "Mn")
+        return s.replace("_", " ").replace("-", " ")
+
+    MAP = {
+        # Code tiers / Sage
+        "code sage":     "code_sage",
+        "code tiers":    "code_sage",
+        "code":          "code_sage",
+        "num":           "code_sage",
+        "numero":        "code_sage",
+        "ct num":        "code_sage",
+        # Intitulé
+        "intitule":      "intitule",
+        "intitule tiers":"intitule",
+        "raison sociale":"intitule",
+        "nom":           "intitule",
+        "denomination":  "intitule",
+        "libelle":       "intitule",
+        # Adresse
+        "adresse":       "adresse",
+        "adresse 1":     "adresse",
+        "adresse1":      "adresse",
+        "rue":           "adresse",
+        "voie":          "adresse",
+        # Complément
+        "complement":    "complement",
+        "adresse 2":     "complement",
+        "adresse2":      "complement",
+        "bat":           "complement",
+        "batiment":      "complement",
+        # Ville
+        "ville":         "ville",
+        "commune":       "ville",
+        "localite":      "ville",
+        # CP
+        "code postal":   "code_postal",
+        "cp":            "code_postal",
+        "codepostal":    "code_postal",
+        "zip":           "code_postal",
+        # SIREN/SIRET base
+        "siren":         "siren_base",
+        "siret":         "siren_base",
+        "siren base":    "siren_base",
+        "siret base":    "siren_base",
+        "ct siret":      "siren_base",
+        "num siren":     "siren_base",
+        "num siret":     "siren_base",
+        # TVA base
+        "tva":           "tva_base",
+        "tva base":      "tva_base",
+        "num tva":       "tva_base",
+        "numero tva":    "tva_base",
+        "identifiant":   "tva_base",
+        "ct identifiant":"tva_base",
+        # ── Variantes export (suffixe "source") ──────────
+        "adresse (source)":    "adresse",
+        "adresse1 (source)":   "adresse",
+        "complement (source)": "complement",
+        "ville (source)":      "ville",
+        "cp (source)":         "code_postal",
+        "code postal (source)":"code_postal",
+        "siret base":          "siren_base",
+        "siren base":          "siren_base",
+        # ── Résultats re-importables ──────────────────────
+        "siren trouve":        "siren_base",
+        "siret trouve":        "siren_base",
+        "adresse trouvee":     "adresse",
+        "cp trouve":           "code_postal",
+        "ville trouvee":       "ville",
+        "tva calcule":         "tva_base",
+    }
+
     rec = make_record()
     for k, v in row.items():
-        key = MAP.get(str(k).lower().strip())
-        if key: rec[key] = str(v).strip()
-    if rec["ville"]: rec["ville"] = rec["ville"].title()
+        key = MAP.get(_nk(k))
+        if key:
+            rec[key] = str(v).strip()
+    if rec["ville"]:
+        rec["ville"] = rec["ville"].title()
     return rec
 
 
@@ -196,6 +298,7 @@ COLUMNS = [
     ("sir_b", "SIREN base",        120,  "siren_base",      True),
     ("tva_b", "TVA base",          130,  "tva_base",        True),
     ("sir_t", "SIREN trouvé",      120,  "siren_trouve",    True),
+    ("sit_t", "SIRET trouvé",      130,  "siret_trouve",    True),
     ("tva_c", "TVA calculé",       130,  "tva_calcule",     True),
     ("tva_s", "Ctrl TVA",           90,  "tva_statut",      True),
     ("adr_t", "Adresse trouvée",   175,  "adresse_trouvee", True),
@@ -341,6 +444,7 @@ class AideRFE:
         self._col_filters = {}
         self.tree         = None
         self._sel_label   = None   # label compteur de sélection
+        self._cell_editor = None   # Entry flottante pour copier le texte
 
         self._apply_styles()
         self._build_ui()
@@ -511,7 +615,7 @@ class AideRFE:
         _sec("DONNÉES")
         for icon, label, cmd in [
             ("⚡", "Connexion",                self.btn_connexion),
-            ("⬇", "Télécharger modèle CSV",  self.btn_export_exemple),
+            ("⬇", "Exemple de modèle",  self.btn_export_exemple),
             ("⬆", "Import CSV / Excel",       self.btn_import),
         ]:
             SbBtn(sb, icon, label, cmd).pack(fill=tk.X, padx=4, pady=1)
@@ -587,35 +691,42 @@ class AideRFE:
     # ── Barre de filtres par colonne (au-dessus table) ────
 
     def _build_filter_bar(self, parent):
+        """
+        Deux lignes scrollables (Canvas) synchronisées avec le scroll
+        horizontal de la table via _filter_xview().
+        """
         bar = tk.Frame(parent, bg=C_WHITE)
-        bar.pack(fill=tk.X, padx=10, pady=(6,0))
+        bar.pack(fill=tk.X, padx=10, pady=(6, 0))
         tk.Frame(bar, bg=C_BORDER, height=1).pack(fill=tk.X)
 
-        inner = tk.Frame(bar, bg=C_WHITE)
-        inner.pack(fill=tk.X, padx=6, pady=5)
+        # ── Ligne 1 : filtres par colonne ────────────────
+        # Canvas scrollable pour les champs de filtre
+        self._flt_canvas = tk.Canvas(bar, bg=C_WHITE, height=52,
+                                      highlightthickness=0, bd=0)
+        self._flt_canvas.pack(fill=tk.X)
+
+        inner = tk.Frame(self._flt_canvas, bg=C_WHITE)
+        self._flt_win = self._flt_canvas.create_window(
+            (0, 0), window=inner, anchor="nw")
 
         tk.Label(inner, text="Filtres :",
                  bg=C_WHITE, fg=C_TEXT2,
-                 font=(FONT_UI, 11, "bold")).pack(side=tk.LEFT, padx=(2,6))
+                 font=(FONT_UI, 11, "bold")).pack(side=tk.LEFT, padx=(6, 6))
 
         self._col_filters = {}
         for cid, label, width, key, filtrable in COLUMNS:
             if not filtrable: continue
-
             col_frm = tk.Frame(inner, bg=C_WHITE)
             col_frm.pack(side=tk.LEFT, padx=2)
-
             tk.Label(col_frm,
-                     text=label[:9]+("…" if len(label)>9 else ""),
+                     text=label,
                      bg=C_WHITE, fg=C_TEXT2,
                      font=(FONT_UI, 10)).pack(anchor="w")
-
             var = tk.StringVar()
             var.trace_add("write", lambda *_: self.refresh_table())
             self._col_filters[key] = var
-
             e = tk.Entry(col_frm, textvariable=var,
-                         width=max(5, width//9),
+                         width=max(5, width // 9),
                          bg=C_BG, fg=C_TEXT,
                          relief="flat", bd=0,
                          font=(FONT_UI, 11),
@@ -625,91 +736,241 @@ class AideRFE:
                          highlightcolor=C_ACCENT)
             e.pack(ipady=3)
 
-        tk.Button(inner, text="✕ Effacer filtres",
-                  command=self._clear_filters,
-                  bg=C_WHITE, fg=C_DANGER,
-                  activebackground="#fee2e2",
-                  font=(FONT_UI, 11), relief="flat",
-                  cursor="hand2", bd=0,
-                  padx=6).pack(side=tk.RIGHT, padx=6)
+        def _flt_configure(e):
+            self._flt_canvas.configure(
+                scrollregion=self._flt_canvas.bbox("all"))
+        inner.bind("<Configure>", _flt_configure)
+
+        def _flt_resize(e):
+            self._flt_canvas.itemconfig(
+                self._flt_win, width=max(e.width,
+                    self._flt_canvas.winfo_reqwidth()))
+        self._flt_canvas.bind("<Configure>", _flt_resize)
 
         tk.Frame(bar, bg=C_BORDER, height=1).pack(fill=tk.X)
 
-        # ── Ligne sous les filtres : options de sélection ──
-        sub = tk.Frame(bar, bg=C_WHITE)
-        sub.pack(fill=tk.X, padx=6, pady=(3, 5))
+        # ── Ligne 2 : conteneur principal (hauteur fixe) ──
+        sub_row = tk.Frame(bar, bg=C_WHITE, height=42)
+        sub_row.pack(fill=tk.X)
+        sub_row.pack_propagate(False)
 
-        tk.Checkbutton(sub, text="Afficher les enregistrements complets",
-                       variable=self.var_show_all,
-                       command=self.refresh_table,
-                       bg=C_WHITE, fg=C_TEXT2,
-                       activebackground=C_WHITE,
-                       selectcolor=C_BG,
-                       font=(FONT_UI, 11), cursor="hand2",
-                       relief="flat").pack(side=tk.LEFT, padx=(2, 16))
+        # ── Partie DROITE fixe : boutons d'action ────────
+        # Pack en premier à droite pour qu'ils ne bougent jamais
+        fixed_right = tk.Frame(sub_row, bg=C_WHITE)
+        fixed_right.pack(side=tk.RIGHT, padx=(0, 6), pady=2)
 
-        for txt, cmd in [("☑  Tout cocher", self.check_all),
-                          ("☐  Tout décocher", self.uncheck_all)]:
-            tk.Button(sub, text=txt, command=cmd,
-                      bg=C_BG, fg=C_TEXT2,
-                      activebackground=C_BORDER,
-                      font=(FONT_UI, 11), relief="flat",
-                      padx=10, pady=3, cursor="hand2",
-                      bd=0).pack(side=tk.LEFT, padx=4)
+        tk.Frame(fixed_right, bg=C_BORDER, width=1).pack(
+            side=tk.LEFT, fill=tk.Y, padx=(0, 8), pady=4)
 
-        # Séparateur vertical
-        tk.Frame(sub, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
-
-        # Boutons cocher/décocher la sélection
-        for txt, cmd in [("☑ Cocher sélection",   lambda: self._check_selection(True)),
-                          ("☐ Décocher sélection", lambda: self._check_selection(False))]:
-            tk.Button(sub, text=txt, command=cmd,
-                      bg=C_BG, fg=C_TEXT2,
-                      activebackground=C_BORDER,
-                      font=(FONT_UI, 11), relief="flat",
-                      padx=10, pady=3, cursor="hand2",
-                      bd=0).pack(side=tk.LEFT, padx=4)
-
-        tk.Frame(sub, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
-
-        # Compteur de sélection
-        self._sel_label = tk.Label(sub, text="",
-                                    bg=C_WHITE, fg=C_ACCENT,
-                                    font=(FONT_UI, 10, "bold"))
-        self._sel_label.pack(side=tk.LEFT, padx=6)
-
-        tk.Frame(sub, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
-
-        # Boutons Traitements avec la couleur du bandeau latéral
         for icon, txt, cmd in [
             ("🔍", "Recherche SIRENE",  self.btn_recherche),
             ("🧮", "Calculer N° TVA",   self.btn_calculer_tva),
             ("🔎", "Vérifier TVA",      self.btn_verifier_tva),
         ]:
-            btn = tk.Button(sub, text=f"{icon}  {txt}", command=cmd,
+            btn = tk.Button(fixed_right, text=f"{icon}  {txt}", command=cmd,
                             bg=SB_BG, fg=SB_TEXT_A,
                             activebackground=SB_HOVER,
                             activeforeground=SB_TEXT_A,
                             font=(FONT_UI, 11, "bold"),
-                            relief="flat", padx=12, pady=4,
+                            relief="flat", padx=10, pady=4,
                             cursor="hand2", bd=0)
-            btn.pack(side=tk.LEFT, padx=4)
+            btn.pack(side=tk.LEFT, padx=3)
             btn.bind("<Enter>", lambda e, b=btn: b.config(bg=SB_HOVER))
             btn.bind("<Leave>", lambda e, b=btn: b.config(bg=SB_BG))
 
-    # ── Table ─────────────────────────────────────────────
+        # ── Partie GAUCHE fixe ─────────────────────────
+        sub = tk.Frame(sub_row, bg=C_WHITE)
+        sub.pack(side=tk.LEFT, fill=tk.Y, pady=2)
+        self._sub_canvas = None
+
+        # "Afficher complets"
+        tk.Checkbutton(sub, text="Afficher complets",
+                       variable=self.var_show_all,
+                       command=self.refresh_table,
+                       bg=C_WHITE, fg=C_TEXT2,
+                       activebackground=C_WHITE, selectcolor=C_BG,
+                       font=(FONT_UI, 10), cursor="hand2",
+                       relief="flat").pack(side=tk.LEFT, padx=(6, 4))
+
+        tk.Frame(sub, bg=C_BORDER, width=1).pack(
+            side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
+
+        # Boutons dans l'ordre : Cocher sél > Décocher sél > Tout cocher > Tout décocher
+        # Couleurs : vert pour cocher, rouge pour décocher, gris clair pour "tout"
+        def _action_btn(parent, txt, cmd, bg_col, fg_col, hover_col):
+            b = tk.Button(parent, text=txt, command=cmd,
+                          bg=bg_col, fg=fg_col,
+                          activebackground=hover_col, activeforeground=fg_col,
+                          font=(FONT_UI, 10, "bold"),
+                          relief="flat", bd=0,
+                          padx=8, pady=3,
+                          cursor="hand2",
+                          wraplength=0)   # pas de retour ligne
+            b.pack(side=tk.LEFT, padx=3)
+            b.bind("<Enter>", lambda e, w=b, h=hover_col: w.config(bg=h))
+            b.bind("<Leave>", lambda e, w=b, c=bg_col:    w.config(bg=c))
+            return b
+
+        _action_btn(sub,
+                    "☑ Cocher sélection",
+                    lambda: self._check_selection(True),
+                    "#16a34a", "white", "#15803d")   # vert
+
+        _action_btn(sub,
+                    "☐ Décocher sélection",
+                    lambda: self._check_selection(False),
+                    "#dc2626", "white", "#b91c1c")   # rouge
+
+        tk.Frame(sub, bg=C_BORDER, width=1).pack(
+            side=tk.LEFT, fill=tk.Y, padx=6, pady=4)
+
+        _action_btn(sub,
+                    "☑ Tout cocher",
+                    self.check_all,
+                    "#2563eb", "white", "#1d4ed8")   # bleu
+
+        _action_btn(sub,
+                    "☐ Tout décocher",
+                    self.uncheck_all,
+                    "#64748b", "white", "#475569")   # ardoise
+
+        tk.Frame(sub, bg=C_BORDER, width=1).pack(
+            side=tk.LEFT, fill=tk.Y, padx=6, pady=4)
+
+        self._sel_label = tk.Label(sub, text="",
+                                    bg=C_WHITE, fg=C_ACCENT,
+                                    font=(FONT_UI, 10, "bold"))
+        self._sel_label.pack(side=tk.LEFT, padx=4)
+
+        tk.Frame(bar, bg=C_BORDER, height=1).pack(fill=tk.X)
+
+    # ════════════════════════════════════════════════════════
+    #  BARRE DE NAVIGATION HORIZONTALE
+    # ════════════════════════════════════════════════════════
+
+    # Groupes de colonnes pour les raccourcis de navigation
+    _COL_GROUPS = [
+        ("📋 Base",    "code"),    # Code Tiers
+        ("📍 Adresse", "adr"),     # Adresse source
+        ("🔍 SIRENE",  "sir_t"),   # SIREN trouvé
+        ("🧾 TVA",     "tva_c"),   # TVA calculé
+        ("📌 Résultat","adr_t"),   # Adresse trouvée
+        ("💡 Sugg.",   "sugg"),    # Suggestions
+    ]
+
+    def _build_col_navbar(self, parent):
+        """Barre de navigation au-dessus de la table."""
+        nav = tk.Frame(parent, bg=C_BG, height=34)
+        nav.pack(fill=tk.X)
+        nav.pack_propagate(False)
+        tk.Frame(nav, bg=C_BORDER, height=1).pack(side=tk.BOTTOM, fill=tk.X)
+
+        inner = tk.Frame(nav, bg=C_BG)
+        inner.pack(fill=tk.BOTH, expand=True, padx=6)
+
+        # ── Flèches ◀ ▶ ─────────────────────────────────
+        def _arrow_btn(txt, cmd):
+            b = tk.Button(inner, text=txt, command=cmd,
+                          bg=C_BG, fg=C_TEXT,
+                          activebackground=C_BORDER,
+                          font=(FONT_UI, 12, "bold"),
+                          relief="flat", bd=0,
+                          padx=8, pady=0,
+                          cursor="hand2")
+            b.pack(side=tk.LEFT)
+            b.bind("<Enter>", lambda e, w=b: w.config(bg=C_BORDER))
+            b.bind("<Leave>", lambda e, w=b: w.config(bg=C_BG))
+            return b
+
+        _arrow_btn("◀◀", lambda: self.tree.xview_moveto(0))
+        _arrow_btn("◀",  lambda: self.tree.xview_scroll(-3, "units"))
+        _arrow_btn("▶",  lambda: self.tree.xview_scroll(3,  "units"))
+        _arrow_btn("▶▶", lambda: self.tree.xview_moveto(1))
+
+        # Séparateur
+        tk.Frame(inner, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=4)
+
+        # ── Raccourcis groupes ───────────────────────────
+        tk.Label(inner, text="Aller à :",
+                 bg=C_BG, fg=C_TEXT2,
+                 font=(FONT_UI, 10)).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._nav_btns = {}
+        for label, col_id in self._COL_GROUPS:
+            b = tk.Button(inner, text=label,
+                          command=lambda c=col_id: self._scroll_to_col(c),
+                          bg=C_BG, fg=C_TEXT2,
+                          activebackground=C_BORDER,
+                          font=(FONT_UI, 10),
+                          relief="flat", bd=0,
+                          padx=8, pady=2,
+                          cursor="hand2")
+            b.pack(side=tk.LEFT, padx=2)
+            b.bind("<Enter>", lambda e, w=b: w.config(bg=C_BORDER, fg=C_TEXT))
+            b.bind("<Leave>", lambda e, w=b: w.config(bg=C_BG,     fg=C_TEXT2))
+            self._nav_btns[col_id] = b
+
+        # ── Indicateur de position (mis à jour via _hsb_set) ─
+        tk.Frame(inner, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=4)
+        self._nav_pos_lbl = tk.Label(inner, text="◄────►",
+                                      bg=C_BG, fg=C_TEXT2,
+                                      font=(FONT_MONO, 9))
+        self._nav_pos_lbl.pack(side=tk.LEFT)
+
+    def _hsb_set(self, first, last):
+        """Proxy entre xscrollcommand et hsb : synchro filtres + indicateur."""
+        self._hsb.set(first, last)
+        self._update_nav_indicator(float(first), float(last))
+        # Synchroniser le Canvas de filtres
+        try:
+            self._flt_canvas.xview_moveto(first)
+        except Exception:
+            pass
+
+    def _update_nav_indicator(self, first, last):
+        """Affiche une mini-barre de progression de la position horizontale."""
+        try:
+            W   = 20   # largeur de la barre en caractères
+            pos = int(first * W)
+            vis = max(1, int((last - first) * W))
+            bar = "─" * pos + "█" * vis + "─" * max(0, W - pos - vis)
+            pct = int(first * 100)
+            self._nav_pos_lbl.config(text=f"◄{bar}►  {pct}%")
+        except Exception:
+            pass
+
+    def _scroll_to_col(self, col_id):
+        """Fait défiler horizontalement pour rendre une colonne visible."""
+        try:
+            cols = list(self.tree["displaycolumns"])
+            if cols in (["#all"], ("all",)):
+                cols = [c[0] for c in COLUMNS]
+            if col_id not in cols:
+                return
+            idx    = cols.index(col_id)
+            total  = sum(self.tree.column(c, "width") for c in cols)
+            offset = sum(self.tree.column(c, "width") for c in cols[:idx])
+            frac   = offset / total if total else 0
+            self.tree.xview_moveto(frac)
+        except Exception:
+            pass
+
+        # ── Table ─────────────────────────────────────────────
 
     def _build_table(self, parent):
         card = tk.Frame(parent, bg=C_WHITE, relief="flat")
         card.pack(fill=tk.BOTH, expand=True)
 
+        # ── Barre de navigation horizontale ──────────────
+        self._build_col_navbar(card)
+
         tree_frm = tk.Frame(card, bg=C_WHITE)
         tree_frm.pack(fill=tk.BOTH, expand=True)
 
         vsb = ttk.Scrollbar(tree_frm, orient="vertical")
-        hsb = ttk.Scrollbar(tree_frm, orient="horizontal")
+        self._hsb = ttk.Scrollbar(tree_frm, orient="horizontal")
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self._hsb.pack(side=tk.BOTTOM, fill=tk.X)
 
         col_ids = [c[0] for c in COLUMNS]
         self.tree = ttk.Treeview(tree_frm,
@@ -718,10 +979,11 @@ class AideRFE:
                                   style="T.Treeview",
                                   selectmode="extended",
                                   yscrollcommand=vsb.set,
-                                  xscrollcommand=hsb.set)
+                                  xscrollcommand=self._hsb_set)
         vsb.config(command=self.tree.yview)
-        hsb.config(command=self.tree.xview)
+        self._hsb.config(command=self.tree.xview)
 
+        last_col = COLUMNS[-1][0]
         for cid, label, width, key, _ in COLUMNS:
             self.tree.heading(cid, text=label,
                                command=lambda c=cid: self._sort_by(c),
@@ -729,7 +991,7 @@ class AideRFE:
             self.tree.column(cid,
                               width=width,
                               minwidth=max(36, width // 2),
-                              stretch=False,
+                              stretch=(cid == last_col),
                               anchor="center" if cid in ("chk", "score") else "w")
 
         self._setup_col_drag()
@@ -741,17 +1003,20 @@ class AideRFE:
         self.tree.tag_configure("odd",   background=SC_ODD_BG)
         self.tree.tag_configure("even",  background=C_WHITE)
         self.tree.tag_configure("sugg",  background="#fef9c3", foreground="#92400e")
+        # Lignes cochées : gras + italique (pas de changement de couleur)
+        self.tree.tag_configure("checked",
+            font=(FONT_UI, 12, "bold italic"))
 
 
         self.tree.pack(fill=tk.BOTH, expand=True)
-        self.tree.bind("<ButtonRelease-1>", self._on_click)
+        self.tree.bind("<ButtonRelease-1>", self._on_combined_click)
         self.tree.bind("<Double-Button-1>",  self._on_double_click)
         self.tree.bind("<Button-3>",         self._on_right_click)   # clic droit
         self.tree.bind("<space>",            self._on_space)         # Espace
-        # Laisser le Treeview gérer nativement Shift/Ctrl pour la multi-sélection
         self.tree.bind("<<TreeviewSelect>>", self._on_selection_change)
         self.tree.bind("<Control-a>",        self._select_all_visible)
         self.tree.bind("<Control-A>",        self._select_all_visible)
+
 
     # ── Drag & drop des colonnes ──────────────────────────
 
@@ -1108,7 +1373,7 @@ class AideRFE:
             win_var.set(True)
             mode_var.set("ini")
             json_path_var.set("")
-            _refresh_json_row()
+            _on_mode_change()
             _set_st("🗑  Paramètres effacés.", C_TEXT2)
         tk.Button(mem_row, text="🗑 Effacer",
                   command=_do_forget,
@@ -1541,7 +1806,7 @@ class AideRFE:
         self._prog(0, f"0 / {n}")
         done_count = [0]
         lock = _th.Lock()
-        sem = _th.Semaphore(4)
+        sem = _th.Semaphore(5)
 
         def _lookup_safe(rec):
             with sem:
@@ -1550,13 +1815,13 @@ class AideRFE:
                 except Exception:
                     rec["siren_trouve"] = "erreur"
                     rec["score"] = "0"
-                time.sleep(1.2)
+                time.sleep(0.8)
             with lock:
                 done_count[0] += 1
                 pct = done_count[0] / n * 100
                 self._prog(pct, "En cours de traitement…")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             futures = [pool.submit(_lookup_safe, rec) for rec in records]
             concurrent.futures.wait(futures)
 
@@ -1568,99 +1833,193 @@ class AideRFE:
     def _sirene_lookup(self, rec):
         intitule = rec.get("intitule", "").strip()
         adresse  = rec.get("adresse",  "").strip()
-        ville    = rec.get("ville",    "").strip()
-        cp       = rec.get("code_postal", "").strip()
+        ville    = clean_ville(rec.get("ville", "").strip())
+        cp_raw   = rec.get("code_postal", "").strip()
+        cp       = clean_cp(cp_raw) or clean_cp(ville) or clean_cp(rec.get("ville",""))
 
         if not intitule and not adresse:
-            rec.update(siren_trouve="non trouvé", score="0"); return
+            rec.update(siren_trouve="non trouvé", siret_trouve="", score="0")
+            return
 
-        params = {"per_page": "25"}
-        if intitule:
-            params["q"] = intitule
-        else:
-            params["q"] = adresse
-        if cp:
-            params["code_postal"] = cp
+        # ── Utilitaire requête API ────────────────────────────────────────────
+        def _fetch(q, cp_filter=None, per_page=25):
+            if not q: return []
+            p = {"per_page": str(per_page), "q": q}
+            if cp_filter:
+                p["code_postal"] = cp_filter
+            try:
+                r = requests.get(
+                    "https://recherche-entreprises.api.gouv.fr/search",
+                    params=p, timeout=8)
+                if r.status_code == 200:
+                    return r.json().get("results", [])
+            except requests.Timeout:
+                rec.update(siren_trouve="timeout", siret_trouve="", score="0"); raise
+            except Exception:
+                rec.update(siren_trouve="erreur réseau", siret_trouve="", score="0"); raise
+            return []
 
-        try:
-            resp = requests.get(
-                "https://recherche-entreprises.api.gouv.fr/search",
-                params=params, timeout=8)
-        except requests.Timeout:
-            rec.update(siren_trouve="timeout", score="0"); return
-        except Exception:
-            rec.update(siren_trouve="erreur réseau", score="0"); return
+        def _fetch_robust(q, cp_filter=None):
+            """Cherche : avec CP → sans CP → par mots individuels si toujours vide."""
+            res = _fetch(q, cp_filter)
+            if not res and cp_filter:
+                res = _fetch(q, None)
+            # Si toujours vide, chercher mot par mot (gestion des fautes de frappe)
+            if not res and q:
+                words = [w for w in normalize_str(q).split()
+                         if len(w) > 3 and w not in
+                         {"SARL","SAS","SA","EURL","SCI","SNC","GIE","EI","AGENCE","CABINET"}]
+                for w in words[:3]:
+                    partial = _fetch(w, cp_filter)
+                    if not partial and cp_filter:
+                        partial = _fetch(w, None)
+                    res.extend(r for r in partial
+                               if r.get("siren") not in {x.get("siren") for x in res})
+                    if res: break
+            return res
 
-        if resp.status_code != 200:
-            rec.update(siren_trouve="non trouvé", score="0"); return
+        # ── Ville fuzzy matching ──────────────────────────────────────────────
+        def _ville_match(v1, v2):
+            """True si les deux villes sont suffisamment proches."""
+            n1 = normalize_str(v1).split()
+            n2 = normalize_str(v2).split()
+            if not n1 or not n2: return False
+            # Correspondance exacte après normalisation
+            if " ".join(n1) == " ".join(n2): return True
+            # Au moins un mot significatif (>3 chars) commun
+            sig1 = set(w for w in n1 if len(w) > 3)
+            sig2 = set(w for w in n2 if len(w) > 3)
+            if sig1 & sig2: return True
+            # Première partie du nom suffit (ex: "SOLLIES" ⊂ "SOLLIES PONT")
+            if n1[0] == n2[0] and len(n1[0]) > 4: return True
+            return False
 
-        results = resp.json().get("results", [])
-        if not results:
-            rec.update(siren_trouve="non trouvé", score="0",
-                       adresse_trouvee="", cp_trouve="", ville_trouvee="",
-                       suggestions=[], suggestions_txt=""); return
-
-        best_score, best = 0, None
-        candidates_by_addr = []   # correspondance adresse
-        candidates_by_name = []   # correspondance nom seul
-
-        for r in results:
-            siege  = r.get("siege", {}) or {}
-            r_adr  = " ".join(filter(None, [
+        # ── Extraction de l'enregistrement API ───────────────────────────────
+        def _extract(r):
+            siege   = r.get("siege", {}) or {}
+            r_adr   = " ".join(filter(None, [
                 str(siege.get("numero_voie",  "") or "").strip(),
                 str(siege.get("type_voie",    "") or "").strip(),
                 str(siege.get("libelle_voie", "") or "").strip()]))
-            r_cp   = str(siege.get("code_postal",     "") or "").strip()
-            r_vil  = str(siege.get("libelle_commune", "") or "").strip().title()
-            nom_r  = r.get("nom_raison_sociale", "") or ""
+            r_cp    = str(siege.get("code_postal",     "") or "").strip()
+            r_vil   = str(siege.get("libelle_commune", "") or "").strip().title()
+            nom_r   = (r.get("nom_raison_sociale") or r.get("nom_complet") or
+                       r.get("nom_commercial") or siege.get("nom_commercial") or
+                       (r.get("personne_morale_attributs") or {}).get("raison_sociale") or "")
+            nom_r   = str(nom_r).strip()
             siren_r = r.get("siren", "")
+            siret_r = str(siege.get("siret","") or r.get("siret","") or "").strip()
+            return r_adr, r_cp, r_vil, nom_r, siren_r, siret_r
 
-            nom_ok  = intitule and (
-                normalize_str(intitule) in normalize_str(nom_r) or
-                normalize_str(nom_r)    in normalize_str(intitule))
-            adr_ok  = addr_similarity(adresse, r_adr) > 0.45
-            cp_ok   = (cp == r_cp)
-            vil_ok  = bool(ville) and (
-                normalize_str(ville) in normalize_str(r_vil) or
-                normalize_str(r_vil) in normalize_str(ville))
+        # ── Lancer les recherches ─────────────────────────────────────────────
+        results_name = []
+        results_addr = []
+
+        # Optimisation SIREN de base
+        siren_base = rec.get("siren_base", "").strip()
+        if siren_base and siren_base.isdigit() and len(siren_base) in (9, 14):
+            try:
+                direct = _fetch(siren_base[:9])
+                if direct:
+                    results_name = direct
+            except Exception:
+                pass
+
+        try:
+            if not results_name and intitule:
+                results_name = _fetch_robust(intitule, cp or None)
+
+            # Recherche par adresse : chercher les entreprises dans le CP/ville
+            # L'API ne cherche pas par adresse → on récupère les entreprises
+            # dans le secteur géo (CP) et on filtre par similarité d'adresse
+            if cp:
+                results_addr = _fetch(intitule or "a", cp, per_page=25)
+                if not results_addr and ville:
+                    # Essai département (2 premiers chiffres du CP)
+                    dep_q = (intitule[:10] if intitule else "") or "entreprise"
+                    results_addr = _fetch(dep_q, cp)
+            elif ville:
+                # Pas de CP : chercher par mots-clés ville + intitulé
+                ville_words = [w for w in normalize_str(ville).split() if len(w) > 3]
+                if ville_words and intitule:
+                    results_addr = _fetch_robust(intitule + " " + ville_words[0])
+        except Exception:
+            return
+
+        # ── Scoring ───────────────────────────────────────────────────────────
+        NOM_STOP = {"SAS","SA","SARL","SNC","EURL","SCI","GIE","EI","ET",
+                    "DE","DU","DES","LE","LA","LES","L","D","AGENCE","CABINET"}
+
+        def _nom_match(ni, nr):
+            if not ni or not nr: return False
+            if ni in nr or nr in ni: return True
+            wi = set(ni.split()) - NOM_STOP
+            wr = set(nr.split()) - NOM_STOP
+            if not wi or not wr: return False
+            common = wi & wr
+            # Au moins 1 mot significatif (>3 chars) en commun
+            sig = [w for w in common if len(w) > 3]
+            if sig: return True
+            # Ou majorité des mots courts
+            return len(common) >= max(1, min(len(wi), len(wr)) - 1)
+
+        best_score, best = 0, None
+        candidates_by_addr = []
+        candidates_by_name = []
+        seen_sirens = set()
+        all_results = list(results_name)
+        for r in results_addr:
+            if r.get("siren") not in {x.get("siren") for x in all_results}:
+                all_results.append(r)
+
+        ni = normalize_str(intitule)
+
+        for r in all_results:
+            r_adr, r_cp, r_vil, nom_r, siren_r, siret_r = _extract(r)
+            nr = normalize_str(nom_r)
+
+            nom_ok  = _nom_match(ni, nr)
+            adr_ok  = bool(adresse) and addr_similarity(adresse, r_adr) > 0.35
+            cp_ok   = bool(cp) and (cp == r_cp)
+            vil_ok  = bool(ville) and _ville_match(ville, r_vil)
 
             sc = (100 if nom_ok and adr_ok and (cp_ok or vil_ok)
-                  else 70 if adr_ok and cp_ok and vil_ok
-                  else 50 if nom_ok
+                  else 100 if nom_ok and cp_ok
+                  else 70  if nom_ok and (vil_ok or adr_ok)
+                  else 70  if adr_ok and (cp_ok or vil_ok)
+                  else 50  if nom_ok
                   else 0)
+
+            tva_calc = calculate_tva_fr(siren_r)
+            c = dict(siren=siren_r, siret=siret_r, nom=nom_r,
+                     adresse=r_adr, cp=r_cp, ville=r_vil,
+                     tva=tva_calc, score=sc)
 
             if sc > best_score:
                 best_score = sc
-                best = dict(siren=siren_r, adresse=r_adr, cp=r_cp, ville=r_vil, nom=nom_r)
+                best = dict(siren=siren_r, siret=siret_r,
+                            adresse=r_adr, cp=r_cp, ville=r_vil, nom=nom_r)
 
-            tva_calc = calculate_tva_fr(siren_r)
-            candidate = {
-                "siren":   siren_r,
-                "nom":     nom_r,
-                "adresse": r_adr,
-                "cp":      r_cp,
-                "ville":   r_vil,
-                "tva":     tva_calc,
-                "score":   sc,
-            }
-            # Candidats par adresse (cas normal)
-            if adr_ok and (cp_ok or vil_ok):
-                candidates_by_addr.append(candidate)
-            # Candidats par nom seul (cas "seulement intitulé trouvé", score=50)
-            elif nom_ok and not adr_ok:
-                candidates_by_name.append(candidate)
+            if sc > 0:
+                if adr_ok and (cp_ok or vil_ok):
+                    candidates_by_addr.append(c)
+                else:
+                    candidates_by_name.append(c)
+            seen_sirens.add(siren_r)
 
+        # ── Mise à jour du record ─────────────────────────────────────────────
         if best and best_score > 0:
-            rec.update(siren_trouve=best["siren"], score=str(best_score),
+            rec.update(siren_trouve=best["siren"],
+                       siret_trouve=best["siret"] if best["siret"] else "",
+                       score=str(best_score),
                        adresse_trouvee=best["adresse"],
                        cp_trouve=best["cp"], ville_trouvee=best["ville"])
         else:
-            rec.update(siren_trouve="non trouvé", score="0",
+            rec.update(siren_trouve="non trouvé", siret_trouve="",
+                       score="0",
                        adresse_trouvee="", cp_trouve="", ville_trouvee="")
 
         best_siren = best["siren"] if best else ""
-
-        # Fusionner candidats adresse + candidats nom (dédupliqués par SIREN)
         merged = {c["siren"]: c for c in candidates_by_addr}
         for c in candidates_by_name:
             if c["siren"] not in merged:
@@ -1675,6 +2034,7 @@ class AideRFE:
         else:
             rec["suggestions_txt"] = ""
 
+
     # ════════════════════════════════════════════════════════
     #  E  CALCULER TVA
     # ════════════════════════════════════════════════════════
@@ -1688,7 +2048,11 @@ class AideRFE:
             return
         n = 0
         for rec in todo:
-            s = rec.get("siren_trouve","").strip()
+            # Priorité : siret_trouve[:9] > siren_trouve > siren_base
+            siret_t = rec.get("siret_trouve","").strip()
+            s = siret_t[:9] if (siret_t and siret_t.isdigit() and len(siret_t)==14) else ""
+            if not s:
+                s = rec.get("siren_trouve","").strip()
             if not (s and s.isdigit() and len(s)==9):
                 s = rec.get("siren_base","").strip()
             tva = calculate_tva_fr(s)
@@ -1897,13 +2261,15 @@ class AideRFE:
                 rec.get("adresse",""),        rec.get("complement",""),
                 rec.get("ville",""),          rec.get("code_postal",""),
                 rec.get("siren_base",""),     rec.get("tva_base",""),
-                rec.get("siren_trouve",""),   rec.get("tva_calcule",""),
-                tva_st,
+                rec.get("siren_trouve",""),   rec.get("siret_trouve",""),
+                rec.get("tva_calcule",""),    tva_st,
                 rec.get("adresse_trouvee",""),rec.get("cp_trouve",""),
                 rec.get("ville_trouvee",""),  score,
                 rec.get("suggestions_txt","")]
             iid = rec.get("code_sage") or str(id(rec))
-            self.tree.insert("", tk.END, iid=iid, values=values, tags=(tag,))
+            # Combiner le tag de score/couleur avec le tag checked si coché
+            tags = (tag, "checked") if rec.get("checked") else (tag,)
+            self.tree.insert("", tk.END, iid=iid, values=values, tags=tags)
 
         self._status(f"{len(rows)} tiers affichés  /  {len(self.data)} total")
 
@@ -1950,6 +2316,95 @@ class AideRFE:
         if iids:
             self.tree.selection_set(iids)
         return "break"
+
+
+
+    # Colonnes adresse sur lesquelles l'éditeur flottant est actif
+    _EDITABLE_COLS = {"adr", "cpl", "vil", "adr_t", "vil_t"}
+
+    def _on_combined_click(self, event):
+        """Dispatch : colonne ☑ → cochage  |  colonne adresse → éditeur texte."""
+        self._on_click(event)
+        if self.tree.identify_region(event.x, event.y) == "cell":
+            col_pos = self.tree.identify_column(event.x)
+            if col_pos == "#1":
+                return
+            dc = self.tree["displaycolumns"]
+            if dc in (("all",), "all"):
+                dc = [c[0] for c in COLUMNS]
+            idx = int(col_pos[1:]) - 1
+            if 0 <= idx < len(dc) and dc[idx] in self._EDITABLE_COLS:
+                self._show_cell_editor(event)
+
+    # ─────────────────────────────────────────────────────
+    #  ÉDITEUR DE CELLULE  –  sélection / copie de texte
+    # ─────────────────────────────────────────────────────
+
+    def _show_cell_editor(self, event):
+        """
+        Sur les colonnes adresse : affiche une Entry flottante sur la cellule,
+        texte pré-sélectionné — sélectionner et copier avec Ctrl+C ou clic-glisser.
+        """
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        if col == "#1":
+            return
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+
+        col_idx  = int(col[1:]) - 1
+        all_vals = self.tree.item(item, "values")
+        cell_val = str(all_vals[col_idx]) if col_idx < len(all_vals) else ""
+
+        tree_x = self.tree.winfo_rootx()
+        tree_y = self.tree.winfo_rooty()
+        bbox   = self.tree.bbox(item, col)
+        if not bbox:
+            return
+        bx, by, bw, bh = bbox
+        abs_x = tree_x + bx
+        abs_y = tree_y + by
+
+        if hasattr(self, "_cell_editor") and self._cell_editor:
+            try: self._cell_editor.destroy()
+            except Exception: pass
+            self._cell_editor = None
+
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.geometry(f"{bw}x{bh}+{abs_x}+{abs_y}")
+        popup.configure(bg=C_WHITE)
+        popup.attributes("-topmost", True)
+
+        var   = tk.StringVar(value=cell_val)
+        entry = tk.Entry(popup,
+                         textvariable=var,
+                         font=(FONT_UI, 11),
+                         bg="#eef4ff", fg=C_TEXT,
+                         relief="flat", bd=1,
+                         selectbackground="#bfdbfe",
+                         selectforeground=C_TEXT)
+        entry.pack(fill=tk.BOTH, expand=True)
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+
+        self._cell_editor = popup
+
+        def _close(e=None):
+            try: popup.destroy()
+            except Exception: pass
+            self._cell_editor = None
+
+        entry.bind("<Escape>",   _close)
+        entry.bind("<Return>",   _close)
+        entry.bind("<Tab>",      _close)
+        entry.bind("<FocusOut>", lambda e: self.root.after(100, _close))
+        entry.bind("<Key>", lambda e: "break" if e.keysym not in
+                   ("c","C","a","A","Left","Right","Home","End",
+                    "Shift_L","Shift_R","Control_L","Control_R") else None)
 
     def _on_click(self, event):
         if self.tree.identify_region(event.x, event.y) != "cell": return
@@ -2066,12 +2521,13 @@ class AideRFE:
         frm.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
 
         SCOLS = [
-            ("nom",     "Raison sociale", 240),
-            ("siren",   "SIREN",          100),
-            ("tva",     "TVA calculé",    125),
-            ("adresse", "Adresse",        200),
+            ("nom",     "Raison sociale", 220),
+            ("siren",   "SIREN",           95),
+            ("siret",   "SIRET",          120),
+            ("tva",     "TVA calculé",    120),
+            ("adresse", "Adresse",        190),
             ("cp",      "CP",              55),
-            ("ville",   "Ville",          120),
+            ("ville",   "Ville",          110),
         ]
         tree2 = ttk.Treeview(frm,
                               columns=[c[0] for c in SCOLS],
@@ -2079,9 +2535,10 @@ class AideRFE:
                               style="T.Treeview",
                               selectmode="browse",
                               height=12)
-        for cid, label, w in SCOLS:
+        for idx2, (cid, label, w) in enumerate(SCOLS):
             tree2.heading(cid, text=label, anchor="w")
-            tree2.column(cid, width=w, minwidth=40, stretch=False, anchor="w")
+            tree2.column(cid, width=w, minwidth=40,
+                         stretch=(idx2 == len(SCOLS) - 1), anchor="w")
 
         tree2.tag_configure("even", background=C_WHITE)
         tree2.tag_configure("odd",  background=SC_ODD_BG)
@@ -2096,8 +2553,9 @@ class AideRFE:
         for i, s in enumerate(suggestions):
             tree2.insert("", tk.END,
                          values=[s.get("nom",""),     s.get("siren",""),
-                                 s.get("tva",""),     s.get("adresse",""),
-                                 s.get("cp",""),      s.get("ville","")],
+                                 s.get("siret",""),   s.get("tva",""),
+                                 s.get("adresse",""), s.get("cp",""),
+                                 s.get("ville","")],
                          tags=("odd" if i % 2 else "even",))
 
         btn_frm = tk.Frame(dlg, bg=C_WHITE)
@@ -2126,10 +2584,11 @@ class AideRFE:
                 dlg.grab_set()
                 return
             source_rec["siren_trouve"]    = vals[1]
-            source_rec["tva_calcule"]     = vals[2]
-            source_rec["adresse_trouvee"] = vals[3]
-            source_rec["cp_trouve"]       = vals[4]
-            source_rec["ville_trouvee"]   = vals[5]
+            source_rec["siret_trouve"]    = vals[2]
+            source_rec["tva_calcule"]     = vals[3]
+            source_rec["adresse_trouvee"] = vals[4]
+            source_rec["cp_trouve"]       = vals[5]
+            source_rec["ville_trouvee"]   = vals[6]
             source_rec["score"]           = "70"
             remaining = [s for s in source_rec["suggestions"]
                          if s.get("siren") != vals[1]]
@@ -2214,18 +2673,173 @@ class AideRFE:
                 if r.get("checked")
                 and r.get("siren_trouve", "") not in INVALID_SIREN
                 and str(r.get("siren_trouve", "")).isdigit()
-                and len(str(r.get("siren_trouve", ""))) == 9]
+                and len(str(r.get("siren_trouve", ""))) in (9, 14)]
 
         if not todo:
             messagebox.showwarning("Mise à jour",
                 "Aucun tiers coché avec un SIREN valide.\nLancez d'abord la Recherche SIRENE."); return
 
-        if not messagebox.askyesno("Mise à jour SQL Server",
-                f"{len(todo)} tiers seront mis à jour dans F_COMPTET.\n\n"
-                "Champs : CT_Siret, CT_Identifiant,\n"
-                "         CT_Adresse, CT_CodePostal, CT_Ville"): return
+        self._show_update_confirm_dialog(todo)
 
-        threading.Thread(target=self._update_thread, args=(todo,), daemon=True).start()
+    def _show_update_confirm_dialog(self, todo):
+        import datetime as _dt
+        PHRASE = "je confirme l'update et j'en suis l'unique responsable"
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Confirmation mise à jour SQL")
+        dlg.configure(bg=C_WHITE)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        hdr = tk.Frame(dlg, bg="#dc2626", height=46)
+        hdr.pack(fill=tk.X); hdr.pack_propagate(False)
+        tk.Label(hdr, text="⚠  Action irréversible — Mise à jour SQL Server",
+                 bg="#dc2626", fg="white",
+                 font=(FONT_UI, 12, "bold")).pack(expand=True)
+
+        body = tk.Frame(dlg, bg=C_WHITE)
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=16)
+
+        tk.Label(body,
+                 text=str(len(todo)) + " tiers seront modifiés dans F_COMPTET.\n"
+                      "Champs : CT_Siret, CT_Identifiant, CT_Adresse, CT_CodePostal, CT_Ville.",
+                 bg=C_WHITE, fg=C_TEXT, font=(FONT_UI, 11), justify="left"
+                 ).pack(anchor="w", pady=(0, 10))
+
+        tk.Frame(body, bg=C_BORDER, height=1).pack(fill=tk.X, pady=(0, 8))
+
+        # Sauvegarde .bak
+        bak_var = tk.BooleanVar(value=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        bak_path_var = tk.StringVar(value="F_COMPTET_" + ts + ".bak")
+
+        bak_chk = tk.Checkbutton(body,
+                       text="Sauvegarder F_COMPTET avant mise à jour (.bak CSV)",
+                       variable=bak_var,
+                       bg=C_WHITE, fg=C_TEXT,
+                       activebackground=C_WHITE, selectcolor=C_BG,
+                       font=(FONT_UI, 11))
+        bak_chk.pack(anchor="w")
+
+        bak_row = tk.Frame(body, bg=C_WHITE)
+        bak_row.pack(fill=tk.X, pady=(4, 10))
+        bak_entry = tk.Entry(bak_row, textvariable=bak_path_var,
+                             relief="flat", bd=0, width=34,
+                             font=(FONT_UI, 10), bg=C_BG,
+                             highlightthickness=1,
+                             highlightbackground=C_BORDER,
+                             highlightcolor=C_ACCENT)
+        bak_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+
+        def _browse_bak():
+            ts2 = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            p = filedialog.asksaveasfilename(
+                parent=dlg, title="Emplacement de la sauvegarde",
+                initialfile="F_COMPTET_" + ts2 + ".bak",
+                defaultextension=".bak",
+                filetypes=[("Fichier BAK", "*.bak"), ("CSV", "*.csv"), ("Tous", "*.*")])
+            if p: bak_path_var.set(p)
+
+        btn_bak = tk.Button(bak_row, text="📂",
+                  command=_browse_bak, bg=C_BG, fg=C_TEXT2,
+                  activebackground=C_BORDER,
+                  font=(FONT_UI, 10), relief="flat",
+                  bd=0, cursor="hand2", padx=8, pady=2)
+        btn_bak.pack(side=tk.LEFT, padx=4)
+
+        def _toggle_bak():
+            is_bak = bak_var.get()
+            bak_entry.config(state=tk.NORMAL if is_bak else tk.DISABLED,
+                             bg=C_BG if is_bak else "#e8ecf0")
+            btn_bak.config(state=tk.NORMAL if is_bak else tk.DISABLED,
+                           cursor="hand2" if is_bak else "")
+        bak_chk.config(command=_toggle_bak)
+
+        tk.Frame(body, bg=C_BORDER, height=1).pack(fill=tk.X, pady=(0, 10))
+        tk.Label(body, text="Pour continuer, recopiez exactement :",
+                 bg=C_WHITE, fg=C_TEXT2, font=(FONT_UI, 10)).pack(anchor="w")
+        tk.Label(body, text='"' + PHRASE + '"',
+                 bg="#fef9c3", fg="#92400e",
+                 font=(FONT_UI, 11, "italic"),
+                 relief="flat", padx=8, pady=4).pack(fill=tk.X, pady=(4, 6))
+
+        confirm_var = tk.StringVar()
+        confirm_entry = tk.Entry(body, textvariable=confirm_var,
+                                 relief="flat", bd=0,
+                                 font=(FONT_UI, 11), bg=C_BG,
+                                 highlightthickness=1,
+                                 highlightbackground=C_BORDER,
+                                 highlightcolor=C_ACCENT)
+        confirm_entry.pack(fill=tk.X, ipady=5, pady=(0, 4))
+        lbl_ok = tk.Label(body, text="", bg=C_WHITE, font=(FONT_UI, 10))
+        lbl_ok.pack(anchor="w")
+
+        btn_go = tk.Button(body, text="Lancer la mise à jour",
+                           bg="#a0aec0", fg="white", activebackground="#a0aec0",
+                           font=(FONT_UI, 12, "bold"),
+                           relief="flat", bd=0, padx=20, pady=8,
+                           cursor="", state=tk.DISABLED)
+        btn_go.pack(fill=tk.X, pady=(8, 0))
+
+        def _on_type(*_):
+            val = confirm_var.get()
+            if val == PHRASE:
+                lbl_ok.config(text="✅  Phrase correcte", fg=C_SUCCESS)
+                btn_go.config(state=tk.NORMAL, bg=C_DANGER,
+                              activebackground="#b91c1c", cursor="hand2")
+            elif PHRASE.startswith(val):
+                lbl_ok.config(text="", fg=C_TEXT2)
+                btn_go.config(state=tk.DISABLED, bg="#a0aec0", cursor="")
+            else:
+                lbl_ok.config(text="Phrase incorrecte", fg=C_DANGER)
+                btn_go.config(state=tk.DISABLED, bg="#a0aec0", cursor="")
+        confirm_var.trace_add("write", _on_type)
+
+        def _do_go():
+            dlg.destroy()
+            if bak_var.get():
+                bp = bak_path_var.get().strip()
+                if bp: self._backup_f_comptet(bp)
+            threading.Thread(target=self._update_thread, args=(todo,), daemon=True).start()
+        btn_go.config(command=_do_go)
+
+        tk.Button(body, text="Annuler", command=dlg.destroy,
+                  bg=C_BG, fg=C_TEXT2, activebackground=C_BORDER,
+                  font=(FONT_UI, 11), relief="flat",
+                  bd=0, cursor="hand2", padx=16, pady=6
+                  ).pack(fill=tk.X, pady=(6, 0))
+
+        dlg.update_idletasks()
+        w = max(520, dlg.winfo_reqwidth())
+        h = dlg.winfo_reqheight()
+        x = self.root.winfo_x() + (self.root.winfo_width()  - w) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
+        dlg.geometry(str(w) + "x" + str(h) + "+" + str(x) + "+" + str(y))
+        dlg.minsize(w, h)
+
+    def _backup_f_comptet(self, dest_path):
+        """Exporte F_COMPTET en CSV vers dest_path (.bak) avant la mise à jour."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("""
+                SELECT CT_Num, CT_Intitule, CT_Adresse, CT_Complement,
+                       CT_Ville, CT_CodePostal, CT_Siret, CT_Identifiant
+                FROM F_COMPTET ORDER BY CT_Num""")
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            with open(dest_path, "w", newline="", encoding="utf-8-sig") as f:
+                import csv as _csv
+                w = _csv.writer(f, delimiter=";")
+                w.writerow(cols)
+                w.writerows([[str(v or "") for v in row] for row in rows])
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Sauvegarde",
+                "Sauvegarde effectuee (" + str(len(rows)) + " lignes).\n" + str(dest_path)))
+        except Exception as e:
+            self.root.after(0, lambda err=str(e): messagebox.showwarning(
+                "Sauvegarde échouée",
+                "La sauvegarde n'a pas pu etre creee :\n" + err +
+                "\n\nLa mise a jour va continuer quand meme."))
 
     def _update_thread(self, records):
         n       = len(records)
@@ -2240,16 +2854,16 @@ class AideRFE:
                 code = rec.get("code_sage", "?")
                 try:
                     siren_t    = str(rec.get("siren_trouve", "")).strip()
+                    siret_t    = str(rec.get("siret_trouve", "")).strip()
                     siret_base = str(rec.get("siren_base",   "")).strip()
 
                     # ── Reconstruction du SIRET ───────────────────────────
-                    # CT_Siret max 14 chars. Le SIREN fait 9 chiffres.
-                    # Si l'original (siret_base) contient encore 14 chiffres
-                    # et que ses 9 premiers = siren_t → on garde le NIC (5 derniers)
-                    # Sinon on écrit le SIREN seul (Sage accepte 9 chiffres)
-                    if (len(siret_base) == 14 and siret_base.isdigit()
+                    # Priorité : siret_trouve (14 chiffres) > siret_base > siren seul
+                    if siret_t and siret_t.isdigit() and len(siret_t) == 14:
+                        siret_write = siret_t             # SIRET SIRENE (meilleure source)
+                    elif (len(siret_base) == 14 and siret_base.isdigit()
                             and siret_base[:9] == siren_t):
-                        siret_write = siret_base          # SIRET complet conservé
+                        siret_write = siret_base          # SIRET original conservé
                     else:
                         siret_write = siren_t             # SIREN seul (9 chiffres)
 
@@ -2316,14 +2930,29 @@ class AideRFE:
         if not self.data:
             messagebox.showwarning("Export", "Aucune donnée à exporter."); return
 
-        # Bilan avant export
-        n_total  = len(self.data)
-        n_sirene = sum(1 for r in self.data if r.get("siren_trouve") and r["siren_trouve"] not in ("","non trouvé","erreur","erreur réseau","timeout"))
-        n_tva    = sum(1 for r in self.data if r.get("tva_calcule","").startswith("FR"))
-        n_ctrl   = sum(1 for r in self.data if r.get("tva_statut") not in ("","Indéterminé"))
+        checked = [r for r in self.data if r.get("checked")]
+        if checked:
+            rep = messagebox.askyesnocancel(
+                "Exporter",
+                str(len(checked)) + " tiers cochés  /  " + str(len(self.data)) + " total.\n\n"
+                "Oui = exporter uniquement les cochés\n"
+                "Non = exporter tous les tiers\n"
+                "Annuler = abandonner")
+            if rep is None: return
+            export_data = checked if rep else self.data
+        else:
+            if not messagebox.askyesno("Exporter",
+                    "Aucun tiers coché. Exporter les " + str(len(self.data)) + " tiers ?"):
+                return
+            export_data = self.data
 
-        if not messagebox.askyesno("Exporter",
-                f"{n_total} tiers  —  {n_sirene} SIREN  |  {n_tva} TVA  |  {n_ctrl} contrôlés\n\nContinuer ?"):
+        n_total  = len(export_data)
+        n_sirene = sum(1 for r in export_data if r.get("siren_trouve") and r["siren_trouve"] not in ("","non trouvé","erreur","erreur réseau","timeout"))
+        n_tva    = sum(1 for r in export_data if r.get("tva_calcule","").startswith("FR"))
+        n_ctrl   = sum(1 for r in export_data if r.get("tva_statut") not in ("","Indéterminé"))
+
+        if not messagebox.askyesno("Confirmer",
+                str(n_total) + " tiers  —  " + str(n_sirene) + " SIREN  |  " + str(n_tva) + " TVA  |  " + str(n_ctrl) + " contrôlés\n\nContinuer ?"):
             return
         path = filedialog.asksaveasfilename(
             title="Exporter les résultats",
@@ -2345,6 +2974,7 @@ class AideRFE:
             ("TVA base",            "tva_base"),
             # ── Résultats SIRENE ──
             ("SIREN trouvé",        "siren_trouve"),
+            ("SIRET trouvé",        "siret_trouve"),
             ("Score SIRENE",        "score"),
             ("Adresse trouvée",     "adresse_trouvee"),
             ("CP trouvé",           "cp_trouve"),
@@ -2358,7 +2988,7 @@ class AideRFE:
         HDRS = [e[0] for e in EXPORT]
         KEYS = [e[1] for e in EXPORT]
 
-        rows = [[r.get(k, "") for k in KEYS] for r in self.data]
+        rows = [[r.get(k, "") for k in KEYS] for r in export_data]
 
         if path.lower().endswith(".xlsx"):
             if not self._ensure_openpyxl(): return
@@ -2408,7 +3038,7 @@ class AideRFE:
             ODD_FILL   = PatternFill("solid", fgColor="F8FAFC")
             EVEN_FILL  = PatternFill("solid", fgColor="FFFFFF")
 
-            for row_idx, (row_data, rec) in enumerate(zip(rows, self.data), 2):
+            for row_idx, (row_data, rec) in enumerate(zip(rows, export_data), 2):
                 ws.append(row_data)
                 ws.row_dimensions[row_idx].height = 18
                 sc  = rec.get("score", "")
@@ -2455,7 +3085,7 @@ class AideRFE:
                 w.writerow(HDRS)
                 w.writerows(rows)
 
-        messagebox.showinfo("Export", f"{len(self.data)} tiers exportés.\n{path}")
+        messagebox.showinfo("Export", f"{len(export_data)} tiers exportés.\n{path}")
 
     # ════════════════════════════════════════════════════════
     #  HELPERS
@@ -2486,8 +3116,21 @@ class AideRFE:
 
 def main():
     root = tk.Tk()
-    try: root.iconbitmap(default="")
-    except: pass
+    # Icône fenêtre + barre des tâches
+    ico = resource_path("logo.ico")
+    if os.path.exists(ico):
+        try:
+            root.iconbitmap(default=ico)
+        except Exception:
+            pass
+    # Plein écran au démarrage
+    try:
+        root.state("zoomed")          # Windows
+    except Exception:
+        try:
+            root.attributes("-zoomed", True)   # Linux
+        except Exception:
+            pass
     AideRFE(root)
     root.mainloop()
 
