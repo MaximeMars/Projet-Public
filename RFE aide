@@ -77,6 +77,33 @@ def normalize_str(s):
     for ch in [",",".","-","'",'"',"(",")"]: s = s.replace(ch," ")
     return " ".join(s.split())
 
+
+def levenshtein_ratio(s1, s2):
+    """Ratio de similarité [0..1] entre deux chaînes (Levenshtein normalisé)."""
+    s1, s2 = s1.strip(), s2.strip()
+    if not s1 or not s2: return 0.0
+    if s1 == s2: return 1.0
+    m, n = len(s1), len(s2)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, n + 1):
+            tmp = dp[j]
+            dp[j] = (prev if s1[i-1] == s2[j-1]
+                     else 1 + min(prev, dp[j], dp[j-1]))
+            prev = tmp
+    return 1.0 - dp[n] / max(m, n)
+
+def make_acronym(s):
+    """Retourne l'acronyme des mots significatifs d'un nom.
+       'AGH CONSULTING' → 'AC', 'CORIOLIS TELECOM' → 'CT'"""
+    STOP = {"SAS","SA","SARL","SNC","EURL","SCI","GIE","EI","ET",
+            "DE","DU","DES","LE","LA","LES","L","D","AGENCE","CABINET"}
+    words = [w for w in normalize_str(s).split()
+             if w not in STOP and len(w) > 1]
+    return "".join(w[0] for w in words)
+
 def addr_similarity(a1, a2):
     STOP = {"RUE","AV","AVE","AVENUE","BD","BOULEVARD","LE","LA","LES",
             "DE","DU","DES","EN","ET","A","AU","IMPASSE","ALLEE"}
@@ -93,7 +120,8 @@ def make_record(**kw):
                 tva_statut="",        # résultat contrôle VIES : ✅/❌/⚠/…
                 suggestions=[],       # liste de dicts {siren, nom, adresse, cp, ville, tva}
                 suggestions_txt="",   # résumé affiché dans la colonne
-                checked=False)
+                checked=False,
+                use_siret=True)   # True=SIRET, False=SIREN pour l'update
     base.update(kw)
     return base
 
@@ -299,6 +327,7 @@ COLUMNS = [
     ("tva_b", "TVA base",          130,  "tva_base",        True),
     ("sir_t", "SIREN trouvé",      120,  "siren_trouve",    True),
     ("sit_t", "SIRET trouvé",      130,  "siret_trouve",    True),
+    ("usit",  "Siret/Siren",       100,  "use_siret",       False),
     ("tva_c", "TVA calculé",       130,  "tva_calcule",     True),
     ("tva_s", "Ctrl TVA",           90,  "tva_statut",      True),
     ("adr_t", "Adresse trouvée",   175,  "adresse_trouvee", True),
@@ -418,6 +447,44 @@ class SbBtn(tk.Frame):
 
 
 # ════════════════════════════════════════════════════════
+#  RATE LIMITER  –  fenêtre glissante 1 seconde
+# ════════════════════════════════════════════════════════
+
+class _SireneRateLimiter:
+    """
+    Limite le débit d'appels vers recherche-entreprises.api.gouv.fr.
+    L'API officielle autorise 7 appels/seconde ; on reste à `rate` (défaut 6)
+    pour garder une marge de sécurité.
+
+    Implémentation : fenêtre glissante d'1 seconde, thread-safe.
+    Tous les threads du pool partagent la même instance → le budget
+    s'applique globalement, quelle que soit la concurrence.
+    """
+
+    def __init__(self, rate: int = 6):
+        import collections as _col
+        self._rate       = rate
+        self._lock       = threading.Lock()
+        self._timestamps = _col.deque()   # monotonic timestamps des derniers appels
+
+    def acquire(self):
+        """Bloque jusqu'à ce qu'un slot soit disponible, puis le consomme."""
+        import time as _t
+        while True:
+            with self._lock:
+                now = _t.monotonic()
+                # Purge les timestamps hors de la fenêtre d'1 s
+                while self._timestamps and self._timestamps[0] <= now - 1.0:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self._rate:
+                    self._timestamps.append(now)
+                    return   # slot disponible : on peut appeler l'API
+                # Calcule le temps minimum à attendre avant qu'un slot se libère
+                wait = 1.0 - (now - self._timestamps[0]) + 0.005   # +5 ms de marge
+            _t.sleep(max(0.005, wait))
+
+
+# ════════════════════════════════════════════════════════
 #  APPLICATION PRINCIPALE
 # ════════════════════════════════════════════════════════
 
@@ -445,6 +512,8 @@ class AideRFE:
         self.tree         = None
         self._sel_label   = None   # label compteur de sélection
         self._cell_editor = None   # Entry flottante pour copier le texte
+        self._api_cache   = {}     # cache requêtes SIRENE (clé: (q,cp))
+        self._api_rl      = _SireneRateLimiter(rate=6)  # max 6 req/s (limite API = 7)
 
         self._apply_styles()
         self._build_ui()
@@ -837,6 +906,19 @@ class AideRFE:
         tk.Frame(sub, bg=C_BORDER, width=1).pack(
             side=tk.LEFT, fill=tk.Y, padx=6, pady=4)
 
+        _action_btn(sub,
+                    "📋 Tiers Siret",
+                    lambda: self._set_selection_use_siret(True),
+                    "#0891b2", "white", "#0e7490")   # cyan
+
+        _action_btn(sub,
+                    "📋 Tiers Siren",
+                    lambda: self._set_selection_use_siret(False),
+                    "#d97706", "white", "#b45309")   # ambre
+
+        tk.Frame(sub, bg=C_BORDER, width=1).pack(
+            side=tk.LEFT, fill=tk.Y, padx=6, pady=4)
+
         self._sel_label = tk.Label(sub, text="",
                                     bg=C_WHITE, fg=C_ACCENT,
                                     font=(FONT_UI, 10, "bold"))
@@ -992,7 +1074,7 @@ class AideRFE:
                               width=width,
                               minwidth=max(36, width // 2),
                               stretch=(cid == last_col),
-                              anchor="center" if cid in ("chk", "score") else "w")
+                              anchor="center" if cid in ("chk", "score", "usit") else "w")
 
         self._setup_col_drag()
 
@@ -1009,6 +1091,7 @@ class AideRFE:
 
 
         self.tree.pack(fill=tk.BOTH, expand=True)
+        self.tree.bind("<ButtonPress-1>",   self._on_press_usit)
         self.tree.bind("<ButtonRelease-1>", self._on_combined_click)
         self.tree.bind("<Double-Button-1>",  self._on_double_click)
         self.tree.bind("<Button-3>",         self._on_right_click)   # clic droit
@@ -1806,20 +1889,20 @@ class AideRFE:
         self._prog(0, f"0 / {n}")
         done_count = [0]
         lock = _th.Lock()
-        sem = _th.Semaphore(5)
 
         def _lookup_safe(rec):
-            with sem:
-                try:
-                    self._sirene_lookup(rec)
-                except Exception:
-                    rec["siren_trouve"] = "erreur"
-                    rec["score"] = "0"
-                time.sleep(0.8)
+            try:
+                self._sirene_lookup(rec)
+            except Exception:
+                rec["siren_trouve"] = "erreur"
+                rec["score"] = "0"
             with lock:
                 done_count[0] += 1
                 pct = done_count[0] / n * 100
-                self._prog(pct, "En cours de traitement…")
+                label = f"{done_count[0]} / {n}"
+                self._prog(pct, label)
+                # Refresh incrémental : mise à jour de la ligne dès qu'elle est traitée
+                self.root.after(0, self.refresh_table)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
             futures = [pool.submit(_lookup_safe, rec) for rec in records]
@@ -1835,66 +1918,102 @@ class AideRFE:
         adresse  = rec.get("adresse",  "").strip()
         ville    = clean_ville(rec.get("ville", "").strip())
         cp_raw   = rec.get("code_postal", "").strip()
-        cp       = clean_cp(cp_raw) or clean_cp(ville) or clean_cp(rec.get("ville",""))
+        cp       = clean_cp(cp_raw) or clean_cp(ville) or clean_cp(rec.get("ville", ""))
 
         if not intitule and not adresse:
             rec.update(siren_trouve="non trouvé", siret_trouve="", score="0")
             return
 
-        # ── Utilitaire requête API ────────────────────────────────────────────
+        NOM_STOP = {"SAS","SA","SARL","SNC","EURL","SCI","GIE","EI","ET",
+                    "DE","DU","DES","LE","LA","LES","L","D","AGENCE","CABINET",
+                    "SOCIETE","GROUPE","HOLDING","SERVICES","SOLUTIONS"}
+
+        # ── Cache + requête API ───────────────────────────────────────────
         def _fetch(q, cp_filter=None, per_page=25):
             if not q: return []
+            cache_key = (q.lower().strip(), cp_filter or "")
+            if cache_key in self._api_cache:
+                return self._api_cache[cache_key]
+            # ── Respect de la limite 7 req/s (on vise 6 pour la marge) ──
+            self._api_rl.acquire()
             p = {"per_page": str(per_page), "q": q}
             if cp_filter:
                 p["code_postal"] = cp_filter
-            try:
-                r = requests.get(
-                    "https://recherche-entreprises.api.gouv.fr/search",
-                    params=p, timeout=8)
-                if r.status_code == 200:
-                    return r.json().get("results", [])
-            except requests.Timeout:
-                rec.update(siren_trouve="timeout", siret_trouve="", score="0"); raise
-            except Exception:
-                rec.update(siren_trouve="erreur réseau", siret_trouve="", score="0"); raise
+            for attempt in range(2):   # retry automatique (point 15)
+                try:
+                    r = requests.get(
+                        "https://recherche-entreprises.api.gouv.fr/search",
+                        params=p, timeout=8)
+                    if r.status_code == 200:
+                        res = r.json().get("results", [])
+                        self._api_cache[cache_key] = res
+                        return res
+                    break
+                except requests.Timeout:
+                    if attempt == 0:
+                        time.sleep(1.0)
+                        continue
+                    rec.update(siren_trouve="timeout", siret_trouve="", score="0")
+                    raise
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(0.5)
+                        continue
+                    rec.update(siren_trouve="erreur réseau", siret_trouve="", score="0")
+                    raise
             return []
 
         def _fetch_robust(q, cp_filter=None):
-            """Cherche : avec CP → sans CP → par mots individuels si toujours vide."""
+            """CP → sans CP → voisins arrondissements → mots individuels → acronyme."""
             res = _fetch(q, cp_filter)
             if not res and cp_filter:
                 res = _fetch(q, None)
-            # Si toujours vide, chercher mot par mot (gestion des fautes de frappe)
+            # Point 6 : arrondissements voisins (75, 69, 13)
+            if not res and cp_filter and cp_filter[:3] in ("750","690","130"):
+                base = int(cp_filter)
+                for delta in (-1, 1, -2, 2):
+                    alt = str(base + delta).zfill(5)
+                    res = _fetch(q, alt)
+                    if res: break
+            # Mots significatifs individuels
             if not res and q:
                 words = [w for w in normalize_str(q).split()
-                         if len(w) > 3 and w not in
-                         {"SARL","SAS","SA","EURL","SCI","SNC","GIE","EI","AGENCE","CABINET"}]
+                         if len(w) > 3 and w not in NOM_STOP]
                 for w in words[:3]:
-                    partial = _fetch(w, cp_filter)
-                    if not partial and cp_filter:
-                        partial = _fetch(w, None)
-                    res.extend(r for r in partial
-                               if r.get("siren") not in {x.get("siren") for x in res})
+                    res = _fetch(w, cp_filter) or _fetch(w, None)
                     if res: break
+            # Point 3 : acronyme
+            if not res and intitule:
+                acr = make_acronym(intitule)
+                if len(acr) >= 2:
+                    res = _fetch(acr, cp_filter) or _fetch(acr, None)
             return res
 
-        # ── Ville fuzzy matching ──────────────────────────────────────────────
-        def _ville_match(v1, v2):
-            """True si les deux villes sont suffisamment proches."""
-            n1 = normalize_str(v1).split()
-            n2 = normalize_str(v2).split()
-            if not n1 or not n2: return False
-            # Correspondance exacte après normalisation
-            if " ".join(n1) == " ".join(n2): return True
-            # Au moins un mot significatif (>3 chars) commun
-            sig1 = set(w for w in n1 if len(w) > 3)
-            sig2 = set(w for w in n2 if len(w) > 3)
-            if sig1 & sig2: return True
-            # Première partie du nom suffit (ex: "SOLLIES" ⊂ "SOLLIES PONT")
-            if n1[0] == n2[0] and len(n1[0]) > 4: return True
-            return False
+        # ── Point 4 : normalisation adresse via API Géo ──────────────────
+        def _normalize_address(adr, cp_hint, ville_hint):
+            """Normalise l'adresse via api-adresse.data.gouv.fr.
+               Retourne (adresse_normalisée, cp_normalisé, ville_normalisée)
+               ou (adr, cp_hint, ville_hint) en cas d'échec."""
+            try:
+                q_parts = [x for x in [adr, cp_hint, ville_hint] if x]
+                if not q_parts: return adr, cp_hint, ville_hint
+                r = requests.get(
+                    "https://api-adresse.data.gouv.fr/search/",
+                    params={"q": " ".join(q_parts), "limit": "1"},
+                    timeout=4)
+                if r.status_code == 200:
+                    feats = r.json().get("features", [])
+                    if feats:
+                        props = feats[0].get("properties", {})
+                        norm_adr  = props.get("name", adr)
+                        norm_cp   = props.get("postcode", cp_hint)
+                        norm_vil  = props.get("city", ville_hint)
+                        return norm_adr, norm_cp, norm_vil
+            except Exception:
+                pass
+            return adr, cp_hint, ville_hint
 
-        # ── Extraction de l'enregistrement API ───────────────────────────────
+        # ── Extraction d'un résultat API ──────────────────────────────────
         def _extract(r):
             siege   = r.get("siege", {}) or {}
             r_adr   = " ".join(filter(None, [
@@ -1909,109 +2028,235 @@ class AideRFE:
             nom_r   = str(nom_r).strip()
             siren_r = r.get("siren", "")
             siret_r = str(siege.get("siret","") or r.get("siret","") or "").strip()
-            return r_adr, r_cp, r_vil, nom_r, siren_r, siret_r
+            # Point 8 : score interne API
+            api_score = float(r.get("score", 0) or 0)
+            # Point 9 : état administratif (C = cessé)
+            etat    = str(siege.get("etat_administratif", "") or
+                          r.get("etat_administratif", "") or "").upper()
+            active  = (etat != "C")
+            return r_adr, r_cp, r_vil, nom_r, siren_r, siret_r, api_score, active
 
-        # ── Lancer les recherches ─────────────────────────────────────────────
-        results_name = []
-        results_addr = []
+        # ── Matching ville souple ─────────────────────────────────────────
+        def _ville_match(v1, v2):
+            n1 = normalize_str(v1).split()
+            n2 = normalize_str(v2).split()
+            if not n1 or not n2: return False
+            if " ".join(n1) == " ".join(n2): return True
+            sig1 = set(w for w in n1 if len(w) > 3)
+            sig2 = set(w for w in n2 if len(w) > 3)
+            if sig1 & sig2: return True
+            if n1[0] == n2[0] and len(n1[0]) > 4: return True
+            return False
 
-        # Optimisation SIREN de base
+        # ── Matching nom ─────────────────────────────────────────────────
+        def _nom_match(ni, nr):
+            if not ni or not nr: return False, 0.0
+            if ni in nr or nr in ni: return True, 1.0
+            # Mots-clés communs
+            wi = set(ni.split()) - NOM_STOP
+            wr = set(nr.split()) - NOM_STOP
+            if wi and wr:
+                sig = [w for w in (wi & wr) if len(w) > 3]
+                if sig: return True, len(sig) / max(len(wi), len(wr))
+            # Point 1 : Levenshtein
+            lev = levenshtein_ratio(ni, nr)
+            if lev >= 0.75: return True, lev
+            # Levenshtein par mots
+            best_lev = 0.0
+            for w1 in [w for w in ni.split() if len(w) > 3]:
+                for w2 in [w for w in nr.split() if len(w) > 3]:
+                    best_lev = max(best_lev, levenshtein_ratio(w1, w2))
+            if best_lev >= 0.80: return True, best_lev
+            # Point 3 : Acronyme
+            if make_acronym(ni) == make_acronym(nr) and len(make_acronym(ni)) >= 2:
+                return True, 0.7
+            return False, 0.0
+
+        # ── Normalisation de l'adresse ────────────────────────────────────
+        adresse_norm, cp_norm, ville_norm = _normalize_address(adresse, cp, ville)
+        if cp_norm and not cp: cp = cp_norm
+        if ville_norm and not ville: ville = ville_norm.title()
+
+        ni = normalize_str(intitule)
+
+        # ── Helper : match confiant dans un lot ───────────────────────────
+        def _is_confident(batch):
+            """
+            Retourne True si le lot contient au moins un résultat avec :
+              - nom correspondant (Levenshtein ≥ 0.75 ou mots clés communs)
+              - ET CP identique au tiers source
+              - ET entreprise active
+            → utilisé pour l'arrêt anticipé des passes : inutile de continuer
+              si on a déjà un match de haute qualité.
+            """
+            if not cp: return False
+            for r in batch:
+                _, r_cp, _, nom_r, _, _, _, active = _extract(r)
+                if not active or r_cp != cp: continue
+                ok, conf = _nom_match(ni, normalize_str(nom_r))
+                if ok and conf >= 0.75:
+                    return True
+            return False
+
+        # ── Lancement des recherches ──────────────────────────────────────
+        # PRIORITÉ :
+        #   0. SIREN de base valide → lookup direct (1 appel, arrêt si confiant)
+        #   1. Intitulé + CP → passes ciblées avec arrêt anticipé dès match confiant
+        #   2. Adresse + CP/Ville sans intitulé → requête géo large
+        #   3. Intitulé seul → recherche par nom (fallback/complément)
+        results_primary = []
+        results_name    = []
+        _seen_primary   = set()
+
+        def _add_primary(batch):
+            for r in batch:
+                s = r.get("siren")
+                if s and s not in _seen_primary:
+                    results_primary.append(r)
+                    _seen_primary.add(s)
+
+        complement = rec.get("complement", "").strip()
         siren_base = rec.get("siren_base", "").strip()
+
+        # ── 0. SIREN/SIRET de base → lookup direct ────────────────────────
         if siren_base and siren_base.isdigit() and len(siren_base) in (9, 14):
             try:
                 direct = _fetch(siren_base[:9])
                 if direct:
-                    results_name = direct
-            except Exception:
-                pass
+                    _add_primary(direct)
+                    if _is_confident(direct):
+                        # Match parfait sur SIREN connu → inutile d'aller plus loin
+                        pass   # continue vers le scoring directement
+            except Exception: pass
 
         try:
-            if not results_name and intitule:
-                results_name = _fetch_robust(intitule, cp or None)
+            # ── 1. Intitulé + CP : passes ciblées avec arrêt anticipé ─────
+            if intitule and cp and not _is_confident(results_primary):
+                mots_sig = [w for w in normalize_str(intitule).split()
+                            if len(w) > 3 and w not in NOM_STOP]
+                acr = make_acronym(intitule)
 
-            # Recherche par adresse : chercher les entreprises dans le CP/ville
-            # L'API ne cherche pas par adresse → on récupère les entreprises
-            # dans le secteur géo (CP) et on filtre par similarité d'adresse
-            if cp:
-                results_addr = _fetch(intitule or "a", cp, per_page=25)
-                if not results_addr and ville:
-                    # Essai département (2 premiers chiffres du CP)
-                    dep_q = (intitule[:10] if intitule else "") or "entreprise"
-                    results_addr = _fetch(dep_q, cp)
-            elif ville:
-                # Pas de CP : chercher par mots-clés ville + intitulé
-                ville_words = [w for w in normalize_str(ville).split() if len(w) > 3]
-                if ville_words and intitule:
-                    results_addr = _fetch_robust(intitule + " " + ville_words[0])
+                # Passe A : intitulé complet + filtre CP
+                #           → cas le plus fréquent et le plus précis (1 seul appel)
+                batch_a = _fetch(intitule, cp)
+                _add_primary(batch_a)
+
+                if not _is_confident(batch_a):
+                    # Passe B : 2 mots significatifs + filtre CP
+                    #           (réduit de 4 à 2 — le 3e/4e mot apporte rarement)
+                    for mot in mots_sig[:2]:
+                        batch_b = _fetch(mot, cp)
+                        _add_primary(batch_b)
+                        if _is_confident(batch_b):
+                            break   # ← arrêt anticipé dès qu'un mot matche
+
+                if not _is_confident(results_primary):
+                    # Passe C : acronyme + filtre CP
+                    if len(acr) >= 2:
+                        _add_primary(_fetch(acr, cp))
+
+                if not _is_confident(results_primary) and len(intitule) > 12:
+                    # Passe D : intitulé tronqué + filtre CP
+                    _add_primary(_fetch(intitule[:12], cp))
+
+                # Passe E : sans filtre CP — filet de dernier recours
+                if not results_primary:
+                    _add_primary(_fetch_robust(intitule, None))
+
+            # ── 2. Adresse + CP/Ville sans intitulé ───────────────────────
+            elif adresse and (cp or ville) and not _is_confident(results_primary):
+                if cp:
+                    q_geo = intitule[:12] if intitule else "a"
+                    _add_primary(_fetch(q_geo, cp, per_page=25))
+                if not results_primary and ville and intitule:
+                    ville_kw = [w for w in normalize_str(ville).split() if len(w) > 3]
+                    if ville_kw:
+                        _add_primary(_fetch_robust(intitule + " " + ville_kw[0]))
+
+            # ── 3. Intitulé seul → complément par nom ─────────────────────
+            if intitule and not _is_confident(results_primary):
+                if ville:
+                    ville_kw = [w for w in normalize_str(ville).split() if len(w) > 3]
+                    if ville_kw:
+                        results_name = [r for r in
+                                        _fetch_robust(intitule + " " + ville_kw[0], cp or None)
+                                        if r.get("siren") not in _seen_primary]
+                if not results_name:
+                    results_name = [r for r in
+                                    _fetch_robust(intitule, cp or None)
+                                    if r.get("siren") not in _seen_primary]
+
         except Exception:
             return
 
-        # ── Scoring ───────────────────────────────────────────────────────────
-        NOM_STOP = {"SAS","SA","SARL","SNC","EURL","SCI","GIE","EI","ET",
-                    "DE","DU","DES","LE","LA","LES","L","D","AGENCE","CABINET"}
-
-        def _nom_match(ni, nr):
-            if not ni or not nr: return False
-            if ni in nr or nr in ni: return True
-            wi = set(ni.split()) - NOM_STOP
-            wr = set(nr.split()) - NOM_STOP
-            if not wi or not wr: return False
-            common = wi & wr
-            # Au moins 1 mot significatif (>3 chars) en commun
-            sig = [w for w in common if len(w) > 3]
-            if sig: return True
-            # Ou majorité des mots courts
-            return len(common) >= max(1, min(len(wi), len(wr)) - 1)
-
-        best_score, best = 0, None
-        candidates_by_addr = []
-        candidates_by_name = []
-        seen_sirens = set()
-        all_results = list(results_name)
-        for r in results_addr:
-            if r.get("siren") not in {x.get("siren") for x in all_results}:
+        # Fusionner : primaires d'abord, puis noms (sans doublons)
+        all_results = list(results_primary)
+        seen_merge  = set(_seen_primary)
+        for r in results_name:
+            s = r.get("siren")
+            if s not in seen_merge:
                 all_results.append(r)
+                seen_merge.add(s)
 
-        ni = normalize_str(intitule)
+        # ── Scoring ───────────────────────────────────────────────────────
+        best_score, best = 0.0, None
+        candidates = []
+        seen_sirens = set()
 
         for r in all_results:
-            r_adr, r_cp, r_vil, nom_r, siren_r, siret_r = _extract(r)
-            nr = normalize_str(nom_r)
+            r_adr, r_cp, r_vil, nom_r, siren_r, siret_r, api_sc, active = _extract(r)
 
-            nom_ok  = _nom_match(ni, nr)
-            adr_ok  = bool(adresse) and addr_similarity(adresse, r_adr) > 0.35
+            # Point 9 : ignorer les entreprises cessées pour le best, mais garder en suggestions
+            nr = normalize_str(nom_r)
+            nom_ok, nom_conf = _nom_match(ni, nr)
+            adr_ok  = bool(adresse) and addr_similarity(adresse_norm or adresse, r_adr) > 0.35
             cp_ok   = bool(cp) and (cp == r_cp)
             vil_ok  = bool(ville) and _ville_match(ville, r_vil)
 
-            sc = (100 if nom_ok and adr_ok and (cp_ok or vil_ok)
-                  else 100 if nom_ok and cp_ok
-                  else 70  if nom_ok and (vil_ok or adr_ok)
-                  else 70  if adr_ok and (cp_ok or vil_ok)
-                  else 50  if nom_ok
-                  else 0)
+            sc = 0.0
+            if   nom_ok and adr_ok and (cp_ok or vil_ok): sc = 100.0
+            elif nom_ok and cp_ok:                         sc = 95.0
+            elif nom_ok and (vil_ok or adr_ok):            sc = 70.0
+            elif adr_ok and (cp_ok or vil_ok):             sc = 70.0
+            elif nom_ok:                                    sc = 50.0
+
+            # Bonus : intitulé ET CP disponibles → on était en mode multi-passes ciblées
+            # Un candidat qui match le CP mérite un coup de pouce même sans adresse exacte
+            if intitule and cp and cp_ok and nom_ok and sc < 95.0:
+                sc = max(sc, 80.0)
+
+            # Point 8 : bonus API score (max +5)
+            sc = min(100.0, sc + api_sc * 5)
+
+            # Malus entreprise cessée
+            if not active: sc = max(0.0, sc - 20.0)
 
             tva_calc = calculate_tva_fr(siren_r)
             c = dict(siren=siren_r, siret=siret_r, nom=nom_r,
                      adresse=r_adr, cp=r_cp, ville=r_vil,
-                     tva=tva_calc, score=sc)
+                     tva=tva_calc, score=round(sc), active=active)
 
-            if sc > best_score:
+            if active and sc > best_score:
                 best_score = sc
-                best = dict(siren=siren_r, siret=siret_r,
-                            adresse=r_adr, cp=r_cp, ville=r_vil, nom=nom_r)
+                best = c.copy()
 
-            if sc > 0:
-                if adr_ok and (cp_ok or vil_ok):
-                    candidates_by_addr.append(c)
-                else:
-                    candidates_by_name.append(c)
+            # Tous les résultats sont candidats aux suggestions
+            # (même score 0 — l'utilisateur choisit)
+            candidates.append(c)
             seen_sirens.add(siren_r)
 
-        # ── Mise à jour du record ─────────────────────────────────────────────
+        # ── Mise à jour du record ─────────────────────────────────────────
+        # Score affiché : arrondi aux paliers 100/70/50/0
+        def _display_score(s):
+            if s >= 95: return "100"
+            if s >= 60: return "70"
+            if s >= 40: return "50"
+            return "0"
+
         if best and best_score > 0:
             rec.update(siren_trouve=best["siren"],
                        siret_trouve=best["siret"] if best["siret"] else "",
-                       score=str(best_score),
+                       score=_display_score(best_score),
                        adresse_trouvee=best["adresse"],
                        cp_trouve=best["cp"], ville_trouvee=best["ville"])
         else:
@@ -2020,17 +2265,35 @@ class AideRFE:
                        adresse_trouvee="", cp_trouve="", ville_trouvee="")
 
         best_siren = best["siren"] if best else ""
-        merged = {c["siren"]: c for c in candidates_by_addr}
-        for c in candidates_by_name:
-            if c["siren"] not in merged:
-                merged[c["siren"]] = c
-        suggestions = [c for c in merged.values() if c["siren"] != best_siren]
+
+        # ── Suggestions : triées par score, dédoublonnées, plafonnées ────
+        # Tous les candidats sauf le best, triés par score décroissant
+        suggestions = sorted(
+            [c for c in candidates if c["siren"] != best_siren],
+            key=lambda x: x["score"], reverse=True
+        )
+
+        # Dédoublonnage par nom normalisé (évite SIREN différents même société)
+        seen_noms = set()
+        dedup = []
+        for s in suggestions:
+            nkey = tuple(normalize_str(s["nom"]).split()[:3])
+            if nkey not in seen_noms:
+                seen_noms.add(nkey)
+                dedup.append(s)
+        suggestions = dedup
+
+        # Point 13 : plafonner à 10, signaler si nom trop générique
+        TOO_GENERIC_THRESHOLD = 10
+        is_generic = len(suggestions) > TOO_GENERIC_THRESHOLD
+        suggestions = suggestions[:10]
 
         rec["suggestions"] = suggestions
         if suggestions:
             noms = ", ".join(s["nom"] for s in suggestions[:3])
             extra = f" +{len(suggestions)-3}" if len(suggestions) > 3 else ""
-            rec["suggestions_txt"] = f"💡 {len(suggestions)} : {noms}{extra}"
+            generic_warn = " ⚠ nom générique" if is_generic else ""
+            rec["suggestions_txt"] = f"💡 {len(suggestions)}{generic_warn} : {noms}{extra}"
         else:
             rec["suggestions_txt"] = ""
 
@@ -2256,12 +2519,14 @@ class AideRFE:
 
             chk = "☑" if rec.get("checked") else "☐"
             tva_st = rec.get("tva_statut", "")
+            usit_lbl = "☑ Siret" if rec.get("use_siret", True) else "☐ Siren"
             values = [chk,
                 rec.get("code_sage",""),      rec.get("intitule",""),
                 rec.get("adresse",""),        rec.get("complement",""),
                 rec.get("ville",""),          rec.get("code_postal",""),
                 rec.get("siren_base",""),     rec.get("tva_base",""),
                 rec.get("siren_trouve",""),   rec.get("siret_trouve",""),
+                usit_lbl,
                 rec.get("tva_calcule",""),    tva_st,
                 rec.get("adresse_trouvee",""),rec.get("cp_trouve",""),
                 rec.get("ville_trouvee",""),  score,
@@ -2290,11 +2555,11 @@ class AideRFE:
                 for r in [self._iid_to_rec(iid)] if r]
 
     def _check_selection(self, state: bool):
-        """Coche ou décoche tous les enregistrements sélectionnés."""
+        """Coche ou décoche tous les enregistrements de la sélection Treeview."""
         recs = self._selected_recs()
         if not recs:
-            # Si rien de sélectionné, applique sur les lignes visibles
-            recs = self._get_visible()
+            self._status("Aucune ligne sélectionnée — utilisez Ctrl+A ou cliquez sur les lignes")
+            return
         for rec in recs:
             rec["checked"] = state
         self.refresh_table()
@@ -2406,21 +2671,62 @@ class AideRFE:
                    ("c","C","a","A","Left","Right","Home","End",
                     "Shift_L","Shift_R","Control_L","Control_R") else None)
 
+    def _on_press_usit(self, event):
+        """ButtonPress-1 : gère le toggle Siret/Siren (colonne usit) sur pression."""
+        if self.tree.identify_region(event.x, event.y) != "cell": return
+        col_id = self.tree.identify_column(event.x)
+        if col_id == "#1": return
+        dc = self.tree["displaycolumns"]
+        if dc in (("all",), "all"): dc = [c[0] for c in COLUMNS]
+        col_idx = int(col_id[1:]) - 1
+        if not (0 <= col_idx < len(dc) and dc[col_idx] == "usit"): return
+        item = self.tree.identify_row(event.y)
+        if not item: return
+        # À ButtonPress-1, la sélection Treeview n'est pas encore mise à jour
+        # (les bindings de classe s'exécutent après les bindings widget).
+        # On force item dans les targets même s'il n'est pas encore dans selection().
+        sel = list(self.tree.selection())
+        if item in sel and len(sel) > 1:
+            targets = [i for i in sel if i]   # bulk : applique à toute la sélection
+        else:
+            targets = [item]                  # clic simple : juste la ligne cliquée
+        recs_targets = [self._iid_to_rec(i) for i in targets if self._iid_to_rec(i)]
+        if not recs_targets: return
+        new_use = not all(r.get("use_siret", True) for r in recs_targets)
+        for rec in recs_targets:
+            rec["use_siret"] = new_use
+
+        # Refresh + restauration de la sélection et du focus pour retour visuel
+        def _refresh_and_reselect():
+            self.refresh_table()
+            try:
+                valid = [i for i in targets if self.tree.exists(i)]
+                if valid:
+                    self.tree.selection_set(valid)
+                    self.tree.focus(valid[0])
+                    self.tree.see(valid[0])
+            except Exception:
+                pass
+
+        self.root.after(0, _refresh_and_reselect)
+        return "break"   # évite que Treeview change la sélection pendant le press
+
     def _on_click(self, event):
         if self.tree.identify_region(event.x, event.y) != "cell": return
         item = self.tree.identify_row(event.y)
         if not item: return
 
-        if self.tree.identify_column(event.x) == "#1":
+        col_id = self.tree.identify_column(event.x)
+        if col_id == "#1":
             # Clic sur la colonne ☑ : bascule tous les sélectionnés (ou juste cette ligne)
             sel = self.tree.selection()
             targets = list(sel) if item in sel and len(sel) > 1 else [item]
-            # Décider de l'état cible : si tous cochés → décocher, sinon cocher
             recs_targets = [self._iid_to_rec(i) for i in targets if self._iid_to_rec(i)]
             new_state = not all(r.get("checked") for r in recs_targets)
             for rec in recs_targets:
                 rec["checked"] = new_state
             self.refresh_table()
+
 
     def _on_space(self, event):
         """Espace : bascule le cochage de la sélection courante."""
@@ -2626,6 +2932,41 @@ class AideRFE:
         self.refresh_table()
         self._status(f"Décochés : {len(rows)} tiers visibles")
 
+    def _set_selection_use_siret(self, use_siret: bool):
+        """
+        Applique le mode SIRET (use_siret=True) ou SIREN (use_siret=False)
+        aux lignes sélectionnées dans le Treeview.
+        Si rien n'est sélectionné, applique à toutes les lignes visibles cochées.
+        Met à jour la colonne « Siret/Siren » en conséquence.
+        """
+        recs = self._selected_recs()
+        if not recs:
+            # Fallback : toutes les lignes visibles cochées
+            recs = [r for r in self._get_visible() if r.get("checked")]
+        if not recs:
+            self._status("Aucune ligne sélectionnée — cliquez sur des lignes ou cochez des tiers")
+            return
+        for rec in recs:
+            rec["use_siret"] = use_siret
+
+        # Restaurer la sélection après refresh
+        selected_iids = list(self.tree.selection())
+
+        def _refresh_and_reselect():
+            self.refresh_table()
+            try:
+                valid = [i for i in selected_iids if self.tree.exists(i)]
+                if valid:
+                    self.tree.selection_set(valid)
+                    self.tree.focus(valid[0])
+                    self.tree.see(valid[0])
+            except Exception:
+                pass
+
+        self.root.after(0, _refresh_and_reselect)
+        label = "SIRET" if use_siret else "SIREN"
+        self._status(f"Mode {label} appliqué à {len(recs)} tiers")
+
     def _sort_by(self, col_id):
         if col_id == "chk": return
         key = next((c[3] for c in COLUMNS if c[0] == col_id), col_id)
@@ -2683,7 +3024,7 @@ class AideRFE:
 
     def _show_update_confirm_dialog(self, todo):
         import datetime as _dt
-        PHRASE = "je confirme l'update et j'en suis l'unique responsable"
+        PHRASE = "Je valide"
 
         dlg = tk.Toplevel(self.root)
         dlg.title("Confirmation mise à jour SQL")
@@ -2714,7 +3055,7 @@ class AideRFE:
         bak_path_var = tk.StringVar(value="F_COMPTET_" + ts + ".bak")
 
         bak_chk = tk.Checkbutton(body,
-                       text="Sauvegarder F_COMPTET avant mise à jour (.bak CSV)",
+                       text="Sauvegarder la base SQL Server (.bak natif)",
                        variable=bak_var,
                        bg=C_WHITE, fg=C_TEXT,
                        activebackground=C_WHITE, selectcolor=C_BG,
@@ -2735,9 +3076,9 @@ class AideRFE:
             ts2 = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
             p = filedialog.asksaveasfilename(
                 parent=dlg, title="Emplacement de la sauvegarde",
-                initialfile="F_COMPTET_" + ts2 + ".bak",
+                initialfile=self.db_cfg.get("database","DB") + "_" + ts2 + ".bak",
                 defaultextension=".bak",
-                filetypes=[("Fichier BAK", "*.bak"), ("CSV", "*.csv"), ("Tous", "*.*")])
+                filetypes=[("SQL Server BAK", "*.bak"), ("Tous", "*.*")])
             if p: bak_path_var.set(p)
 
         btn_bak = tk.Button(bak_row, text="📂",
@@ -2756,9 +3097,9 @@ class AideRFE:
         bak_chk.config(command=_toggle_bak)
 
         tk.Frame(body, bg=C_BORDER, height=1).pack(fill=tk.X, pady=(0, 10))
-        tk.Label(body, text="Pour continuer, recopiez exactement :",
+        tk.Label(body, text="Pour continuer, recopiez exactement la phrase ci-dessous :",
                  bg=C_WHITE, fg=C_TEXT2, font=(FONT_UI, 10)).pack(anchor="w")
-        tk.Label(body, text='"' + PHRASE + '"',
+        tk.Label(body, text=PHRASE,
                  bg="#fef9c3", fg="#92400e",
                  font=(FONT_UI, 11, "italic"),
                  relief="flat", padx=8, pady=4).pack(fill=tk.X, pady=(4, 6))
@@ -2800,7 +3141,8 @@ class AideRFE:
             if bak_var.get():
                 bp = bak_path_var.get().strip()
                 if bp: self._backup_f_comptet(bp)
-            threading.Thread(target=self._update_thread, args=(todo,), daemon=True).start()
+            threading.Thread(target=self._update_thread,
+                             args=(todo,), daemon=True).start()
         btn_go.config(command=_do_go)
 
         tk.Button(body, text="Annuler", command=dlg.destroy,
@@ -2818,30 +3160,68 @@ class AideRFE:
         dlg.minsize(w, h)
 
     def _backup_f_comptet(self, dest_path):
-        """Exporte F_COMPTET en CSV vers dest_path (.bak) avant la mise à jour."""
-        try:
-            cursor = self.db_conn.cursor()
-            cursor.execute("""
-                SELECT CT_Num, CT_Intitule, CT_Adresse, CT_Complement,
-                       CT_Ville, CT_CodePostal, CT_Siret, CT_Identifiant
-                FROM F_COMPTET ORDER BY CT_Num""")
-            rows = cursor.fetchall()
-            cols = [d[0] for d in cursor.description]
-            with open(dest_path, "w", newline="", encoding="utf-8-sig") as f:
-                import csv as _csv
-                w = _csv.writer(f, delimiter=";")
-                w.writerow(cols)
-                w.writerows([[str(v or "") for v in row] for row in rows])
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Sauvegarde",
-                "Sauvegarde effectuee (" + str(len(rows)) + " lignes).\n" + str(dest_path)))
-        except Exception as e:
-            self.root.after(0, lambda err=str(e): messagebox.showwarning(
-                "Sauvegarde échouée",
-                "La sauvegarde n'a pas pu etre creee :\n" + err +
-                "\n\nLa mise a jour va continuer quand meme."))
+        """
+        Lance BACKUP DATABASE via T-SQL.
+        Essaie avec COMPRESSION, puis sans si la version SQL ne la supporte pas.
+        Le chemin DOIT etre accessible en ecriture par le compte de service SQL Server.
+        """
+        db = self.db_cfg.get("database", "")
+        if not db:
+            self.root.after(0, lambda: messagebox.showwarning(
+                "Sauvegarde", "Nom de base introuvable dans la configuration."))
+            return
 
-    def _update_thread(self, records):
+        def _run_backup(with_compression):
+            # BACKUP DATABASE interdit en transaction — connexion autocommit dédiée
+            import importlib as _imp
+            mod = _imp.import_module("pyodbc")
+            cfg = self.db_cfg
+            drivers = [d for d in mod.drivers() if "SQL Server" in d]
+            preferred = [d for d in drivers if any(v in d for v in ("18","17","19"))]
+            driver = (preferred or drivers or ["SQL Server"])[0]
+            cs = ("DRIVER={" + driver + "};SERVER=" + cfg["server"] + ";"
+                  "DATABASE=" + db + ";" +
+                  ("Trusted_Connection=yes;" if cfg.get("win_auth")
+                   else "UID=" + cfg["username"] + ";PWD=" + cfg["password"] + ";"))
+            bak_conn = mod.connect(cs, autocommit=True, timeout=300)
+            try:
+                cursor = bak_conn.cursor()
+                opts = "FORMAT, COPY_ONLY, STATS = 5" + (", COMPRESSION" if with_compression else "")
+                sql = ("BACKUP DATABASE [" + db + "] TO DISK = N'"
+                       + dest_path.replace("'", "''") + "' WITH " + opts)
+                cursor.execute(sql)
+                while True:
+                    try:
+                        if not cursor.nextset(): break
+                    except Exception: break
+            finally:
+                bak_conn.close()
+
+        try:
+            try:
+                _run_backup(with_compression=True)
+            except Exception as e1:
+                if "COMPRESSION" in str(e1).upper() or "3035" in str(e1):
+                    # SQL Express ou edition qui ne supporte pas COMPRESSION
+                    _run_backup(with_compression=False)
+                else:
+                    raise
+            self.root.after(0, lambda p=dest_path: messagebox.showinfo(
+                "Sauvegarde SQL Server",
+                "Sauvegarde reussie !\n\nFichier sur le serveur :\n" + p))
+        except Exception as e:
+            err = str(e)
+            self.root.after(0, lambda err=err: messagebox.showwarning(
+                "Sauvegarde echouee",
+                "Erreur lors du BACKUP DATABASE :\n" + err +
+                "\n\nConseils :\n"
+                "- Le chemin doit etre sur le SERVEUR SQL (ex: C:\\Backup\\db.bak)\n"
+                "- Le compte de service SQL Server doit avoir les droits en ecriture\n"
+                "- Pour un chemin reseau : \\\\serveur\\partage\\db.bak\n"
+                "\nLa mise a jour va continuer quand meme."))
+
+
+    def _update_thread(self, records, use_siret=True):   # use_siret ignoré — utilise rec["use_siret"]
         n       = len(records)
         errors  = []   # liste des (code_sage, message)
         updated = 0
@@ -2857,15 +3237,17 @@ class AideRFE:
                     siret_t    = str(rec.get("siret_trouve", "")).strip()
                     siret_base = str(rec.get("siren_base",   "")).strip()
 
-                    # ── Reconstruction du SIRET ───────────────────────────
-                    # Priorité : siret_trouve (14 chiffres) > siret_base > siren seul
-                    if siret_t and siret_t.isdigit() and len(siret_t) == 14:
-                        siret_write = siret_t             # SIRET SIRENE (meilleure source)
-                    elif (len(siret_base) == 14 and siret_base.isdigit()
-                            and siret_base[:9] == siren_t):
-                        siret_write = siret_base          # SIRET original conservé
+                    # ── Reconstruction de la valeur à écrire (choix par ligne) ──
+                    row_use_siret = rec.get("use_siret", True)
+                    if row_use_siret:
+                        if siret_t and siret_t.isdigit() and len(siret_t) == 14:
+                            siret_write = siret_t
+                        elif len(siret_base) == 14 and siret_base.isdigit() and siret_base[:9] == siren_t:
+                            siret_write = siret_base
+                        else:
+                            siret_write = siren_t
                     else:
-                        siret_write = siren_t             # SIREN seul (9 chiffres)
+                        siret_write = siren_t
 
                     # ── Troncature selon longueurs max F_COMPTET (PDF) ───
                     def trunc(val, maxlen):
@@ -2982,8 +3364,7 @@ class AideRFE:
             # ── TVA ──
             ("TVA calculé",         "tva_calcule"),
             ("Ctrl TVA (VIES)",     "tva_statut"),
-            # ── Suggestions ──
-            ("Suggestions",         "suggestions_txt"),
+            # (Suggestions non exportées)
         ]
         HDRS = [e[0] for e in EXPORT]
         KEYS = [e[1] for e in EXPORT]
