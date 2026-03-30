@@ -1,0 +1,699 @@
+"""
+Outil de recherche et enrichissement de tiers – données SIRENE
+Sources : API Recherche Entreprises (data.gouv.fr)
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+import queue
+import time
+import re
+import unicodedata
+import requests
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import os
+
+BG       = "#1A1D2E"
+PANEL    = "#242740"
+CARD     = "#2E3250"
+ACCENT   = "#6C63FF"
+ACCENT2  = "#4ECDC4"
+TEXT     = "#E8E9F3"
+TEXT_DIM = "#8B8FA8"
+GREEN    = "#2ECC71"
+ORANGE   = "#F39C12"
+RED_C    = "#E74C3C"
+BORDER   = "#3D4166"
+
+FILL_GREEN  = "C8F7D5"
+FILL_ORANGE = "FAE5B0"
+FILL_RED    = "FADBD8"
+
+TIMEOUT = 14
+HEADERS = {"User-Agent": "TiersEnrichisseur/1.0"}
+API_URL = "https://recherche-entreprises.api.gouv.fr/search"
+
+
+def normalize(s):
+    if not s:
+        return ""
+    s = str(s).upper().strip()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def token_sim(a, b):
+    STOP = {"", "SAS", "SA", "SARL", "SCI", "EURL", "SNC", "SE", "SASU", "ET", "DE", "LA", "LE", "LES"}
+    ta = set(normalize(a).split()) - STOP
+    tb = set(normalize(b).split()) - STOP
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta), len(tb))
+
+def clean_cp(cp):
+    if not cp:
+        return ""
+    return str(cp).strip().split(".")[0].zfill(5)
+
+def clean_siren(s):
+    return re.sub(r"[^0-9]", "", str(s or ""))[:9]
+
+def clean_siret(s):
+    return re.sub(r"[^0-9]", "", str(s or ""))[:14]
+
+def api_get(params):
+    try:
+        r = requests.get(API_URL, params=params, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.json().get("results", [])
+    except Exception:
+        return []
+
+def best_etab(result, cp_cible, siret_cible=""):
+    etabs = result.get("matching_etablissements") or []
+    siege = result.get("siege") or {}
+    if not etabs:
+        etabs = [siege] if siege else []
+
+    if siret_cible:
+        for e in etabs:
+            if clean_siret(e.get("siret","")) == siret_cible:
+                return e
+
+    cpn = clean_cp(cp_cible)
+    if cpn:
+        flt = [e for e in etabs if clean_cp(e.get("code_postal","")) == cpn]
+        if flt:
+            etabs = flt
+
+    for e in etabs:
+        if e.get("est_siege"):
+            return e
+    return etabs[0] if etabs else siege
+
+def build_adr(etab):
+    parts = [str(etab.get(k,"") or "").strip()
+             for k in ("numero_voie","type_voie","libelle_voie")]
+    adr = " ".join(p for p in parts if p)
+    return (adr or str(etab.get("adresse","") or "")).upper()
+
+def enrich_row(row):
+    intitule  = str(row.get("intitule","") or "").strip()
+    adresse_o = str(row.get("adresse","") or "").strip()
+    cp_o      = clean_cp(row.get("code_postal",""))
+    ville_o   = str(row.get("ville","") or "").strip()
+    siren_o   = clean_siren(row.get("siren",""))
+    siret_o   = clean_siret(row.get("siret",""))
+    mode      = str(row.get("siren_ou_siret","") or "").lower().strip()
+
+    if not intitule:
+        return {}, ""
+
+    candidates = []
+
+    # 1) Par SIRET
+    if siret_o and len(siret_o) == 14:
+        candidates += api_get({"q": siret_o, "per_page": 5})
+
+    # 2) Par SIREN
+    if not candidates and siren_o and len(siren_o) == 9:
+        candidates += api_get({"q": siren_o, "per_page": 5})
+
+    # 3) Par nom + CP
+    if not candidates:
+        p = {"q": intitule, "per_page": 25}
+        if cp_o:
+            p["code_postal"] = cp_o
+        candidates += api_get(p)
+
+    # 4) Par nom seul si CP donné mais rien trouvé
+    if not candidates and cp_o:
+        candidates += api_get({"q": intitule, "per_page": 25})
+
+    # 5) Tokens principaux
+    if not candidates:
+        tokens = normalize(intitule).split()
+        if len(tokens) > 1:
+            candidates += api_get({"q": " ".join(tokens[:3]), "per_page": 15})
+
+    if not candidates:
+        return {}, "red"
+
+    best_score  = -999
+    best_result = None
+    best_etab_  = {}
+
+    for c in candidates:
+        nom = c.get("nom_complet") or c.get("nom_raison_sociale") or ""
+        etab = best_etab(c, cp_o, siret_o)
+        score = token_sim(intitule, nom) * 50
+
+        c_siren = clean_siren(c.get("siren",""))
+        if siren_o and c_siren:
+            score += 40 if c_siren == siren_o else -10
+        c_siret = clean_siret(etab.get("siret",""))
+        if siret_o and c_siret:
+            score += 40 if c_siret == siret_o else 0
+
+        etab_cp = clean_cp(etab.get("code_postal",""))
+        if cp_o and etab_cp:
+            if etab_cp == cp_o:
+                score += 35
+            elif etab_cp[:3] == cp_o[:3]:
+                score += 10
+            elif etab_cp[:2] == cp_o[:2]:
+                score += 5
+            else:
+                score -= 25
+
+        etab_ville = (etab.get("libelle_commune") or etab.get("commune") or "")
+        if ville_o and etab_ville:
+            score += token_sim(ville_o, etab_ville) * 20
+
+        etab_adr = build_adr(etab)
+        if adresse_o and etab_adr:
+            score += token_sim(adresse_o, etab_adr) * 10
+
+        if score > best_score:
+            best_score  = score
+            best_result = c
+            best_etab_  = etab
+
+    if best_result is None or best_score < 8:
+        return {}, "red"
+
+    nom_t   = best_result.get("nom_complet") or best_result.get("nom_raison_sociale") or ""
+    siren_t = clean_siren(best_result.get("siren",""))
+    siret_t = clean_siret(best_etab_.get("siret",""))
+    adr_t   = build_adr(best_etab_)
+    cp_t    = clean_cp(best_etab_.get("code_postal",""))
+    ville_t = (best_etab_.get("libelle_commune") or best_etab_.get("commune") or "").upper()
+
+    if "siret" in mode:
+        out_siren, out_siret = "", siret_t
+    elif "siren" in mode:
+        out_siren, out_siret = siren_t, ""
+    else:
+        out_siren, out_siret = siren_t, siret_t
+
+    enriched = {
+        "adresse_trouvee":   adr_t,
+        "complement_trouve": "",
+        "cp_trouve":         cp_t,
+        "ville_trouvee":     ville_t,
+        "siren_trouve":      out_siren,
+        "siret_trouve":      out_siret,
+    }
+
+    ok_nom = token_sim(intitule, nom_t) > 0.40
+    if not ok_nom:
+        return enriched, "red"
+
+    checks = []
+    if cp_o:      checks.append(cp_t == cp_o)
+    if ville_o:   checks.append(token_sim(ville_o, ville_t) > 0.5)
+    if adresse_o: checks.append(token_sim(adresse_o, adr_t) > 0.3)
+    if siren_o:   checks.append(siren_t == siren_o)
+    if siret_o:   checks.append(siret_t == siret_o)
+
+    status = ("green" if (checks and all(checks)) else "orange")
+    return enriched, status
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Enrichissement Tiers – SIRENE")
+        self.geometry("1440x840")
+        self.minsize(980, 620)
+        self.configure(bg=BG)
+        self.df        = None
+        self.col_index = {}
+        self.filepath  = None
+        self.results   = []
+        self.q         = queue.Queue()
+        self._running  = False
+        self._sort_state = {}
+        self._build_styles()
+        self._build_ui()
+        self.after(80, self._poll_queue)
+
+    def _build_styles(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure("prog.Horizontal.TProgressbar",
+                    troughcolor=CARD, background=ACCENT, borderwidth=0, thickness=8)
+        s.configure("Treeview",
+                    background=CARD, foreground=TEXT, fieldbackground=CARD,
+                    rowheight=28, borderwidth=0, font=("Segoe UI", 9))
+        s.configure("Treeview.Heading",
+                    background=PANEL, foreground=ACCENT, borderwidth=0,
+                    font=("Segoe UI", 9, "bold"), padding=(6, 6))
+        s.map("Treeview",
+              background=[("selected", ACCENT)],
+              foreground=[("selected", "white")])
+
+    def _build_ui(self):
+        # Sidebar
+        sb = tk.Frame(self, bg=PANEL, width=235)
+        sb.pack(side="left", fill="y")
+        sb.pack_propagate(False)
+
+        tk.Label(sb, text="🔍", bg=PANEL, fg=ACCENT,
+                 font=("Segoe UI", 30)).pack(pady=(28,4))
+        tk.Label(sb, text="Enrichissement Tiers",
+                 bg=PANEL, fg=TEXT, font=("Segoe UI", 12, "bold"),
+                 justify="center").pack()
+        tk.Label(sb, text="SIRENE · data.gouv.fr",
+                 bg=PANEL, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(pady=(2,20))
+
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=18, pady=4)
+
+        self._btn_import = self._sbtn(sb, "📂  Importer Excel",   self._import)
+        self._btn_search = self._sbtn(sb, "🚀  Lancer Recherche", self._start_search, state="disabled")
+        self._btn_stop   = self._sbtn(sb, "⏹  Arrêter",          self._stop,         state="disabled", fg=RED_C)
+        self._btn_export = self._sbtn(sb, "💾  Exporter Excel",   self._export,       state="disabled", fg=ACCENT2)
+
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=18, pady=16)
+
+        for icon, col, lbl in [("●",GREEN,"Tout matche"),("●",ORANGE,"Partiel / nom seul"),("●",RED_C,"Non trouvé")]:
+            f = tk.Frame(sb, bg=PANEL)
+            f.pack(fill="x", padx=18, pady=3)
+            tk.Label(f, text=icon, bg=PANEL, fg=col, font=("Segoe UI",14)).pack(side="left")
+            tk.Label(f, text=f"  {lbl}", bg=PANEL, fg=TEXT_DIM, font=("Segoe UI",9)).pack(side="left")
+
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=18, pady=16)
+
+        self._lbl_total  = self._sstat(sb, "Lignes",       "0", TEXT)
+        self._lbl_green  = self._sstat(sb, "✅ Vert",      "0", GREEN)
+        self._lbl_orange = self._sstat(sb, "🟠 Orange",    "0", ORANGE)
+        self._lbl_red    = self._sstat(sb, "❌ Rouge",     "0", RED_C)
+        self._lbl_pend   = self._sstat(sb, "⏳ En attente","0", TEXT_DIM)
+
+        # Main
+        main = tk.Frame(self, bg=BG)
+        main.pack(side="right", fill="both", expand=True)
+
+        # Top bar
+        top = tk.Frame(main, bg=PANEL, height=52)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+
+        self._lbl_file = tk.Label(top, text="Aucun fichier chargé",
+                                  bg=PANEL, fg=TEXT_DIM, font=("Segoe UI",10))
+        self._lbl_file.pack(side="left", padx=20, pady=14)
+
+        flt = tk.Frame(top, bg=PANEL)
+        flt.pack(side="right", padx=20)
+        tk.Label(flt, text="Filtre :", bg=PANEL, fg=TEXT_DIM,
+                 font=("Segoe UI",9)).pack(side="left", pady=14)
+        self._filter_var = tk.StringVar(value="Tous")
+        cb = ttk.Combobox(flt, textvariable=self._filter_var,
+                          values=["Tous","Vert","Orange","Rouge","En attente"],
+                          state="readonly", width=12, font=("Segoe UI",9))
+        cb.pack(side="left", padx=8, pady=14)
+        cb.bind("<<ComboboxSelected>>", lambda _: self._refresh_table())
+
+        # Search bar
+        sbar = tk.Frame(main, bg=CARD)
+        sbar.pack(fill="x", padx=16, pady=(10,0))
+        tk.Label(sbar, text="🔎", bg=CARD, fg=TEXT_DIM,
+                 font=("Segoe UI",12)).pack(side="left", padx=8)
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._refresh_table())
+        tk.Entry(sbar, textvariable=self._search_var,
+                 bg=CARD, fg=TEXT, insertbackground=TEXT,
+                 relief="flat", font=("Segoe UI",10), bd=0).pack(
+                     side="left", fill="x", expand=True, pady=8)
+
+        # Progress
+        prog = tk.Frame(main, bg=BG)
+        prog.pack(fill="x", padx=16, pady=(8,0))
+        self._lbl_progress = tk.Label(prog, text="", bg=BG, fg=TEXT_DIM,
+                                      font=("Segoe UI",9), anchor="w")
+        self._lbl_progress.pack(side="left", fill="x", expand=True)
+        self._progress = ttk.Progressbar(prog, style="prog.Horizontal.TProgressbar",
+                                          mode="determinate", length=380)
+        self._progress.pack(side="right", pady=4)
+
+        # Table
+        tbl = tk.Frame(main, bg=BG)
+        tbl.pack(fill="both", expand=True, padx=16, pady=10)
+
+        COLS = ("Intitulé","CP","Ville","SIREN","SIRET","Mode",
+                "Adresse trouvée","CP trouvé","Ville trouvée",
+                "SIREN trouvé","SIRET trouvé","Statut")
+        self._tree = ttk.Treeview(tbl, columns=COLS, show="headings", selectmode="browse")
+        WIDTHS = [170,60,120,100,130,65,200,65,130,100,130,90]
+        for col, w in zip(COLS, WIDTHS):
+            self._tree.heading(col, text=col,
+                               command=lambda c=col: self._sort_by(c))
+            self._tree.column(col, width=w, anchor="w", minwidth=40)
+
+        self._tree.tag_configure("green",   background="#152B1E", foreground=GREEN)
+        self._tree.tag_configure("orange",  background="#2E2210", foreground=ORANGE)
+        self._tree.tag_configure("red",     background="#2B1515", foreground=RED_C)
+        self._tree.tag_configure("pending", background=CARD,      foreground=TEXT_DIM)
+
+        vsb = ttk.Scrollbar(tbl, orient="vertical",   command=self._tree.yview)
+        hsb = ttk.Scrollbar(tbl, orient="horizontal", command=self._tree.xview)
+        self._tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tbl.rowconfigure(0, weight=1)
+        tbl.columnconfigure(0, weight=1)
+        self._tree.bind("<Double-1>", self._show_detail)
+
+        self._status = tk.Label(main, text="Prêt — Importez un fichier Excel pour commencer.",
+                                bg=PANEL, fg=TEXT_DIM, font=("Segoe UI",9),
+                                anchor="w", padx=14, pady=7)
+        self._status.pack(fill="x", side="bottom")
+
+    def _sbtn(self, p, text, cmd, state="normal", fg=ACCENT):
+        b = tk.Button(p, text=text, command=cmd, state=state,
+                      bg=CARD, fg=fg, activebackground=ACCENT,
+                      activeforeground="white", font=("Segoe UI",10,"bold"),
+                      relief="flat", cursor="hand2", pady=10, padx=14,
+                      anchor="w", bd=0, highlightthickness=0)
+        b.pack(fill="x", padx=14, pady=3)
+        return b
+
+    def _sstat(self, p, label, val, color):
+        f = tk.Frame(p, bg=PANEL)
+        f.pack(fill="x", padx=18, pady=2)
+        tk.Label(f, text=label, bg=PANEL, fg=TEXT_DIM,
+                 font=("Segoe UI",9)).pack(side="left")
+        lbl = tk.Label(f, text=val, bg=PANEL, fg=color,
+                       font=("Segoe UI",9,"bold"))
+        lbl.pack(side="right")
+        return lbl
+
+    def _sort_by(self, col):
+        rev = self._sort_state.get(col, False)
+        items = [(self._tree.set(k, col), k) for k in self._tree.get_children("")]
+        items.sort(reverse=rev)
+        for i, (_, k) in enumerate(items):
+            self._tree.move(k, "", i)
+        self._sort_state[col] = not rev
+
+    def _show_detail(self, event):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        vals = self._tree.item(sel[0], "values")
+        COLS = ("Intitulé","CP","Ville","SIREN","SIRET","Mode",
+                "Adresse trouvée","CP trouvé","Ville trouvée",
+                "SIREN trouvé","SIRET trouvé","Statut")
+        win = tk.Toplevel(self, bg=BG)
+        win.title("Détail de la ligne")
+        win.geometry("540x460")
+        tk.Label(win, text="📋 Détail", bg=BG, fg=ACCENT,
+                 font=("Segoe UI",13,"bold")).pack(pady=(18,8))
+        for col, val in zip(COLS, vals):
+            row = tk.Frame(win, bg=CARD, pady=4)
+            row.pack(fill="x", padx=16, pady=2)
+            tk.Label(row, text=col, bg=CARD, fg=TEXT_DIM,
+                     font=("Segoe UI",9), width=22, anchor="w").pack(side="left", padx=8)
+            tk.Label(row, text=val or "–", bg=CARD, fg=TEXT,
+                     font=("Segoe UI",9,"bold"), anchor="w").pack(side="left", padx=4)
+        tk.Button(win, text="Fermer", command=win.destroy,
+                  bg=ACCENT, fg="white", relief="flat",
+                  font=("Segoe UI",10,"bold"), padx=20, pady=8,
+                  cursor="hand2").pack(pady=16)
+
+    def _import(self):
+        path = filedialog.askopenfilename(
+            title="Importer un fichier Excel",
+            filetypes=[("Excel","*.xlsx *.xls"),("Tous","*.*")])
+        if not path:
+            return
+        try:
+            df = pd.read_excel(path, header=0, dtype=str).fillna("")
+            df.columns = [str(c).strip() for c in df.columns]
+
+            ALIASES = {
+                "intitule":          ["intitulé","intitule","nom","raison sociale","libellé"],
+                "adresse":           ["adresse"],
+                "complement":        ["complément","complement"],
+                "code_postal":       ["code postal","code_postal","cp","code postale"],
+                "ville":             ["ville"],
+                "siren":             ["siren"],
+                "siret":             ["siret"],
+                "tva":               ["n° de tva","tva","n°tva"],
+                "siren_ou_siret":    ["siren ou siret ?","siren ou siret","siren_ou_siret","type id"],
+                "adresse_trouvee":   ["adresse trouvée","adresse trouvee","adresse_trouvee"],
+                "complement_trouve": ["complément  trouvée","complement trouvee","complement_trouve","complément trouvée"],
+                "cp_trouve":         ["code postal  trouvée","code postal trouvee","cp_trouve","code postal trouvée"],
+                "ville_trouvee":     ["ville trouvée","ville trouvee","ville_trouvee"],
+                "siren_trouve":      ["siren trouvée","siren trouvee","siren_trouve"],
+                "siret_trouve":      ["siret trouvée","siret trouvee","siret_trouve"],
+            }
+            raw_lower = {c.lower(): c for c in df.columns}
+            col_index = {}
+            for key, alist in ALIASES.items():
+                for alias in alist:
+                    if alias.lower() in raw_lower:
+                        col_index[key] = raw_lower[alias.lower()]
+                        break
+
+            self.df        = df
+            self.col_index = col_index
+            self.filepath  = path
+            self.results   = [None] * len(df)
+            n = len(df)
+            self._lbl_file.config(text=f"📄 {os.path.basename(path)}  ({n} ligne{'s' if n>1 else ''})")
+            self._btn_search.config(state="normal")
+            self._btn_export.config(state="disabled")
+            self._lbl_total.config(text=str(n))
+            self._lbl_green.config(text="0")
+            self._lbl_orange.config(text="0")
+            self._lbl_red.config(text="0")
+            self._lbl_pend.config(text=str(n))
+            self._progress["value"]   = 0
+            self._progress["maximum"] = max(n, 1)
+            self._status.config(text=f"Fichier chargé : {n} ligne(s) prête(s) à enrichir.")
+            self._refresh_table()
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Impossible de lire le fichier :\n{e}")
+
+    def _gc(self, row, key):
+        col = self.col_index.get(key)
+        if col and col in row.index:
+            return str(row[col]).strip()
+        return ""
+
+    def _row_dict(self, row):
+        return {k: self._gc(row, k) for k in self.col_index}
+
+    def _refresh_table(self):
+        flt    = self._filter_var.get()
+        search = normalize(self._search_var.get())
+        self._tree.delete(*self._tree.get_children())
+        if self.df is None:
+            return
+
+        counts = {"green":0,"orange":0,"red":0,"pending":0}
+
+        for idx, row in self.df.iterrows():
+            res      = (self.results[idx] or {}) if self.results else {}
+            enriched = res.get("enriched", {})
+            status   = res.get("status", "pending")
+            k = status if status in counts else "pending"
+            counts[k] += 1
+
+            if flt == "Vert"       and status != "green":   continue
+            if flt == "Orange"     and status != "orange":  continue
+            if flt == "Rouge"      and status != "red":     continue
+            if flt == "En attente" and status != "pending": continue
+
+            intitule = self._gc(row,"intitule")
+            cp_o     = self._gc(row,"code_postal")
+            ville_o  = self._gc(row,"ville")
+            siren_o  = self._gc(row,"siren")
+            siret_o  = self._gc(row,"siret")
+            mode_o   = self._gc(row,"siren_ou_siret")
+            adr_t    = enriched.get("adresse_trouvee","")
+            cp_t     = enriched.get("cp_trouve","")
+            ville_t  = enriched.get("ville_trouvee","")
+            siren_t  = enriched.get("siren_trouve","")
+            siret_t  = enriched.get("siret_trouve","")
+
+            if search:
+                blob = normalize(" ".join([intitule,cp_o,ville_o,siren_o,siret_o,adr_t,ville_t]))
+                if search not in blob:
+                    continue
+
+            s_lbl = {"green":"✅ Vert","orange":"🟠 Orange","red":"❌ Rouge"}.get(status,"⏳ En attente")
+            tag   = status if status in ("green","orange","red") else "pending"
+
+            self._tree.insert("","end",iid=str(idx),tags=(tag,),
+                              values=(intitule,cp_o,ville_o,siren_o,siret_o,mode_o,
+                                      adr_t,cp_t,ville_t,siren_t,siret_t,s_lbl))
+
+        self._lbl_green.config(text=str(counts["green"]))
+        self._lbl_orange.config(text=str(counts["orange"]))
+        self._lbl_red.config(text=str(counts["red"]))
+        self._lbl_pend.config(text=str(counts["pending"]))
+
+    def _start_search(self):
+        if self.df is None:
+            return
+        self._running = True
+        self._btn_search.config(state="disabled")
+        self._btn_stop.config(state="normal")
+        self._btn_import.config(state="disabled")
+        self._btn_export.config(state="disabled")
+        self._progress["value"]   = 0
+        self._progress["maximum"] = max(len(self.df),1)
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _stop(self):
+        self._running = False
+        self._btn_stop.config(state="disabled")
+        self._status.config(text="Recherche interrompue par l'utilisateur.")
+
+    def _worker(self):
+        for idx, row in self.df.iterrows():
+            if not self._running:
+                break
+            if not self._gc(row,"intitule"):
+                self.q.put(("result",idx,{},""))
+                continue
+            try:
+                enriched, status = enrich_row(self._row_dict(row))
+            except Exception:
+                enriched, status = {}, "red"
+            self.q.put(("result",idx,enriched,status))
+            time.sleep(0.20)
+        self.q.put(("done",None,None,None))
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind,idx,enriched,status = self.q.get_nowait()
+                if kind == "done":
+                    self._running = False
+                    self._btn_search.config(state="normal")
+                    self._btn_stop.config(state="disabled")
+                    self._btn_import.config(state="normal")
+                    self._btn_export.config(state="normal")
+                    self._status.config(text="✅ Recherche terminée — Vous pouvez exporter.")
+                    self._refresh_table()
+                    break
+                if kind == "result":
+                    self.results[idx] = {"enriched":enriched,"status":status}
+                    done = sum(1 for r in self.results if r is not None)
+                    self._progress["value"] = done
+                    intitule = self._gc(self.df.iloc[idx],"intitule")
+                    pct = done / max(len(self.df),1) * 100
+                    icon = {"green":"✅","orange":"🟠","red":"❌","":"⏭"}.get(status,"⏳")
+                    self._lbl_progress.config(
+                        text=f"{icon}  {done}/{len(self.df)}  |  {intitule[:55]}")
+                    self._status.config(
+                        text=f"Traitement : {pct:.0f}%  ({done}/{len(self.df)}) — {intitule[:65]}")
+                    s_lbl = {"green":"✅ Vert","orange":"🟠 Orange","red":"❌ Rouge","":"⏭ Ignoré"}.get(status,"⏳")
+                    tag   = status if status in ("green","orange","red") else "pending"
+                    try:
+                        r = self.df.iloc[idx]
+                        self._tree.item(str(idx),tags=(tag,),
+                            values=(self._gc(r,"intitule"),self._gc(r,"code_postal"),
+                                    self._gc(r,"ville"),self._gc(r,"siren"),
+                                    self._gc(r,"siret"),self._gc(r,"siren_ou_siret"),
+                                    enriched.get("adresse_trouvee",""),
+                                    enriched.get("cp_trouve",""),
+                                    enriched.get("ville_trouvee",""),
+                                    enriched.get("siren_trouve",""),
+                                    enriched.get("siret_trouve",""),
+                                    s_lbl))
+                    except Exception:
+                        pass
+                    cnts = {"green":0,"orange":0,"red":0}
+                    for r2 in self.results:
+                        if r2 and r2.get("status") in cnts:
+                            cnts[r2["status"]] += 1
+                    self._lbl_green.config(text=str(cnts["green"]))
+                    self._lbl_orange.config(text=str(cnts["orange"]))
+                    self._lbl_red.config(text=str(cnts["red"]))
+                    self._lbl_pend.config(text=str(sum(1 for r2 in self.results if r2 is None)))
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_queue)
+
+    def _export(self):
+        if self.df is None:
+            return
+        out = filedialog.asksaveasfilename(
+            title="Enregistrer le fichier enrichi",
+            defaultextension=".xlsx",
+            filetypes=[("Excel","*.xlsx")])
+        if not out:
+            return
+        try:
+            df_out = self.df.copy()
+            for idx, res in enumerate(self.results):
+                if not res or not res.get("enriched"):
+                    continue
+                e = res["enriched"]
+                def _s(key, val, _i=idx):
+                    col = self.col_index.get(key)
+                    if col and col in df_out.columns:
+                        df_out.at[_i, col] = val
+                _s("adresse_trouvee",   e.get("adresse_trouvee",""))
+                _s("complement_trouve", e.get("complement_trouve",""))
+                _s("cp_trouve",         e.get("cp_trouve",""))
+                _s("ville_trouvee",     e.get("ville_trouvee",""))
+                _s("siren_trouve",      e.get("siren_trouve",""))
+                _s("siret_trouve",      e.get("siret_trouve",""))
+
+            df_out.to_excel(out, index=False)
+
+            wb = load_workbook(out)
+            ws = wb.active
+
+            fills = {
+                "green":  PatternFill("solid", fgColor=FILL_GREEN),
+                "orange": PatternFill("solid", fgColor=FILL_ORANGE),
+                "red":    PatternFill("solid", fgColor=FILL_RED),
+            }
+            hdr_fill = PatternFill("solid", fgColor="1E2140")
+            hdr_font = Font(bold=True, color="FFFFFF", name="Calibri", size=10)
+            thin     = Side(style="thin", color="DDDDDD")
+            brd      = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            for cell in ws[1]:
+                cell.fill      = hdr_fill
+                cell.font      = hdr_font
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border    = brd
+            ws.row_dimensions[1].height = 32
+
+            for col_idx, col in enumerate(ws.columns, 1):
+                max_w = max((len(str(c.value or "")) for c in col), default=8)
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_w+2,10),50)
+
+            for row_idx, res in enumerate(self.results, start=2):
+                fill = fills.get((res or {}).get("status",""))
+                for cell in ws[row_idx]:
+                    if fill:
+                        cell.fill = fill
+                    cell.border    = brd
+                    cell.alignment = Alignment(vertical="center")
+
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            wb.save(out)
+            messagebox.showinfo("Export réussi ✅", f"Fichier enregistré :\n{out}")
+            self._status.config(text=f"✅ Export OK → {out}")
+        except Exception as e:
+            messagebox.showerror("Erreur export", str(e))
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
