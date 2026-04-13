@@ -1,695 +1,1979 @@
 """
-Outil de recherche et enrichissement de tiers – données SIRENE
-Sources : API Recherche Entreprises (data.gouv.fr)
+Enrichissement Tiers – SIRENE  |  v5 — optimisé
+API : recherche-entreprises.api.gouv.fr  (data.gouv.fr, sans clé)
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import threading
-import queue
-import time
-import re
-import unicodedata
-import requests
+import threading, queue, time, re, unicodedata, requests, os
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import os
 
-BG       = "#1A1D2E"
-PANEL    = "#242740"
-CARD     = "#2E3250"
-ACCENT   = "#6C63FF"
-ACCENT2  = "#4ECDC4"
-TEXT     = "#E8E9F3"
-TEXT_DIM = "#8B8FA8"
-GREEN    = "#2ECC71"
-ORANGE   = "#F39C12"
-RED_C    = "#E74C3C"
-BORDER   = "#3D4166"
+# ── Palette ───────────────────────────────────────────────────────────────────
+BG       = "#F5F6FA"; SIDEBAR = "#FFFFFF"; CARD = "#FFFFFF"; CARD2 = "#F0F2F8"
+ACCENT   = "#4F6EF7"; ACCENT_H = "#3A56D4"; ACCENT_L = "#EEF1FE"
+TEXT     = "#1C1E2E"; TEXT2 = "#5A5F7A"; TEXT3 = "#9396A8"; BORDER = "#E2E5F0"
+GREEN    = "#16A34A"; GREEN_BG  = "#DCFCE7"
+ORANGE   = "#D97706"; ORANGE_BG = "#FEF3C7"
+RED      = "#DC2626"; RED_BG    = "#FEE2E2"
+PURPLE   = "#7C3AED"; PURPLE_BG = "#EDE9FE"
 
-FILL_GREEN  = "C8F7D5"
-FILL_ORANGE = "FAE5B0"
-FILL_RED    = "FADBD8"
+FILL_GREEN = "DCFCE7"; FILL_ORANGE = "FEF3C7"; FILL_RED = "FEE2E2"; FILL_PURPLE = "EDE9FE"
 
 TIMEOUT = 14
-HEADERS = {"User-Agent": "TiersEnrichisseur/1.0"}
+HEADERS = {"User-Agent": "TiersEnrichisseur/5.0"}
 API_URL = "https://recherche-entreprises.api.gouv.fr/search"
 
+# ── Regex compilées une seule fois ────────────────────────────────────────────
+_RE_NON_ALPHANUM = re.compile(r"[^A-Z0-9 ]")
+_RE_SPACES       = re.compile(r"\s+")
+_RE_DIGITS_ONLY  = re.compile(r"[^0-9]")
 
-def normalize(s):
+# ── Stop-words (constante module, pas réalloués à chaque appel) ───────────────
+_STOP = frozenset({"","SAS","SA","SARL","SCI","EURL","SNC","SE","SASU",
+                   "ET","DE","LA","LE","LES","DU"})
+
+# ── Colonnes  (label, clé_interne, largeur, visible_par_défaut) ───────────────
+# La sélection utilise la sélection native du Treeview (clic/Shift/Ctrl)
+COLS_DEF = [
+    ("Intitulé",       "intitule",         175, True),
+    ("Adresse orig.",  "adresse",          160, True),
+    ("CP orig.",       "code_postal",       58, True),
+    ("Ville orig.",    "ville",            120, True),
+    ("SIREN orig.",    "siren",             92, False),
+    ("SIRET orig.",    "siret",            122, False),
+    ("Type ID",        "siren_ou_siret",    62, False),
+    ("Adresse trouvée","adresse_trouvee",  200, True),
+    ("CP trouvé",      "cp_trouve",         60, True),
+    ("Ville trouvée",  "ville_trouvee",    130, True),
+    ("SIREN trouvé",   "siren_trouve",      92, True),
+    ("SIRET trouvé",   "siret_trouve",     122, False),
+    ("N° TVA",         "tva_calcule",      115, False),
+    ("Ctrl VIES",      "vies_result",       110, False),
+    ("Statut",         "statut",            92, True),
+]
+ALL_COL_LABELS  = [c[0] for c in COLS_DEF]
+ALL_COL_KEYS    = [c[1] for c in COLS_DEF]
+ALL_COL_WIDTHS  = [c[2] for c in COLS_DEF]
+DEFAULT_VISIBLE = {c[0]: c[3] for c in COLS_DEF}
+_COL_KEY        = {lbl: key for lbl, key, *_ in COLS_DEF}
+_STATUT_IDX     = ALL_COL_LABELS.index("Statut")  # position col Statut
+
+COL_ALIASES = {
+    "intitule":          ["intitulé","intitule","nom","raison sociale","libellé"],
+    "adresse":           ["adresse"],
+    "complement":        ["complément","complement"],
+    "code_postal":       ["code postal","code_postal","cp","code postale"],
+    "ville":             ["ville"],
+    "siren":             ["siren"],
+    "siret":             ["siret"],
+    "tva":               ["n° de tva","tva"],
+    "siren_ou_siret":    ["siren ou siret ?","siren ou siret","siren_ou_siret"],
+    "adresse_trouvee":   ["adresse trouvée","adresse trouvee"],
+    "complement_trouve": ["complément  trouvée","complement trouvee","complément trouvée"],
+    "cp_trouve":         ["code postal  trouvée","code postal trouvee","code postal trouvée"],
+    "ville_trouvee":     ["ville trouvée","ville trouvee"],
+    "siren_trouve":      ["siren trouvée","siren trouvee"],
+    "siret_trouve":      ["siret trouvée","siret trouvee"],
+}
+
+EXPORT_SRC  = ["intitule","adresse","complement","code_postal","ville",
+               "siren","siret","tva","siren_ou_siret"]
+EXPORT_FIND = ["adresse_trouvee","complement_trouve","cp_trouve",
+               "ville_trouvee","siren_trouve","siret_trouve","tva_calcule","vies_result"]
+EXPORT_HDR  = ["Intitulé","adresse","complément","code postal","ville",
+               "Siren","Siret","N° de tva","Siren ou siret ?",
+               "Adresse trouvée","complément trouvée","code postal trouvée",
+               "ville trouvée","Siren trouvées","Siret trouvée","N° TVA calculé","Ctrl VIES"]
+
+_STATUS_LABEL = {
+    "green":      "✅ Vert",
+    "orange":     "🟠 Orange",
+    "red":        "❌ Rouge",
+    "suggestion": "🔍 Suggestion",
+}
+_STATUS_FILL = {
+    "green":      FILL_GREEN,
+    "orange":     FILL_ORANGE,
+    "red":        FILL_RED,
+    "suggestion": FILL_PURPLE,
+}
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def normalize(s: str) -> str:
     if not s:
         return ""
     s = str(s).upper().strip()
     s = unicodedata.normalize("NFD", s)
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    s = re.sub(r"[^A-Z0-9 ]", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+    s = _RE_NON_ALPHANUM.sub(" ", s)
+    return _RE_SPACES.sub(" ", s).strip()
 
-def token_sim(a, b):
-    STOP = {"", "SAS", "SA", "SARL", "SCI", "EURL", "SNC", "SE", "SASU", "ET", "DE", "LA", "LE", "LES"}
-    ta = set(normalize(a).split()) - STOP
-    tb = set(normalize(b).split()) - STOP
+
+def token_sim(a: str, b: str) -> float:
+    ta = set(normalize(a).split()) - _STOP
+    tb = set(normalize(b).split()) - _STOP
     if not ta or not tb:
         return 0.0
     return len(ta & tb) / max(len(ta), len(tb))
 
-def clean_cp(cp):
+
+def clean_cp(cp) -> str:
     if not cp:
         return ""
     return str(cp).strip().split(".")[0].zfill(5)
 
-def clean_siren(s):
-    return re.sub(r"[^0-9]", "", str(s or ""))[:9]
 
-def clean_siret(s):
-    return re.sub(r"[^0-9]", "", str(s or ""))[:14]
+def clean_siren(s) -> str:
+    return _RE_DIGITS_ONLY.sub("", str(s or ""))[:9]
 
-def api_get(params):
+
+def clean_siret(s) -> str:
+    return _RE_DIGITS_ONLY.sub("", str(s or ""))[:14]
+
+
+def compute_tva(siren_str: str) -> str:
+    """N° TVA intracommunautaire FR (formule officielle)."""
+    s = _RE_DIGITS_ONLY.sub("", str(siren_str or ""))
+    if len(s) != 9:
+        return ""
+    key = (12 + 3 * (int(s) % 97)) % 97
+    return f"FR{key:02d}{s}"
+
+
+# ── Vérification VIES (TVA UE) ───────────────────────────────────────────────
+# API REST VIES — deux endpoints pour assurer la compatibilité :
+#   v2 (POST, post-2023) : /rest-api/check-vat-number  { countryCode, vatNumber }
+#   v1 (GET,  pré-2023)  : /rest-api/ms/{cc}/vat/{vat}  (fallback)
+_VIES_V2  = "https://ec.europa.eu/taxation_customs/vies/rest-api/check-vat-number"
+_VIES_V1  = "https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{ms}/vat/{vat}"
+_VIES_HDR = {"Accept": "application/json", "Content-Type": "application/json",
+             "User-Agent": "AideRFE/1.0"}
+_VIES_TIMEOUT = 12
+_VIES_RETRY_DELAY = 2.0   # secondes avant 1 retry
+
+
+def vies_check(tva_str: str, session: requests.Session = None) -> str:
+    """
+    Vérifie un N° TVA intracommunautaire via l'API REST VIES de l'UE.
+    Essaie d'abord l'API v2 (POST), puis fallback v1 (GET).
+    Retourne : "✅ Valide", "❌ Invalide", "⚠ Timeout" ou "⚠ Erreur"
+    """
+    tva = str(tva_str or "").strip().upper().replace(" ", "")
+    if len(tva) < 4 or not tva[:2].isalpha():
+        return ""
+    ms  = tva[:2]   # code pays (ex : FR)
+    vat = tva[2:]   # numéro sans le code pays
+    caller = session or requests
+
+    def _parse(data: dict) -> str:
+        return "✅ Valide" if data.get("isValid") or data.get("valid") else "❌ Invalide"
+
+    # ── Tentative v2 (POST JSON) ──────────────────────────────────────────
+    for attempt in range(2):
+        try:
+            r = caller.post(_VIES_V2,
+                            json={"countryCode": ms, "vatNumber": vat},
+                            headers=_VIES_HDR, timeout=_VIES_TIMEOUT)
+            if r.status_code == 200:
+                return _parse(r.json())
+            if r.status_code in (404, 400):
+                return "❌ Invalide"
+            if r.status_code == 429:
+                # Rate limit → attendre et réessayer une fois
+                if attempt == 0:
+                    time.sleep(_VIES_RETRY_DELAY)
+                    continue
+                return "⚠ Rate limit"
+            break   # autre code HTTP → essaie v1
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                time.sleep(_VIES_RETRY_DELAY)
+                continue
+            # Après retry → fallback v1
+            break
+        except Exception:
+            break
+
+    # ── Fallback v1 (GET) ─────────────────────────────────────────────────
+    for attempt in range(2):
+        try:
+            r = caller.get(_VIES_V1.format(ms=ms, vat=vat),
+                           headers=_VIES_HDR, timeout=_VIES_TIMEOUT)
+            if r.status_code == 200:
+                return _parse(r.json())
+            if r.status_code in (404, 400):
+                return "❌ Invalide"
+            if r.status_code == 429:
+                if attempt == 0:
+                    time.sleep(_VIES_RETRY_DELAY)
+                    continue
+                return "⚠ Rate limit"
+            return "⚠ Erreur"
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                time.sleep(_VIES_RETRY_DELAY)
+                continue
+            return "⚠ Timeout"
+        except Exception:
+            return "⚠ Erreur"
+    return "⚠ Erreur"
+
+
+def api_get(params: dict, session: requests.Session = None) -> list:
     try:
-        r = requests.get(API_URL, params=params, headers=HEADERS, timeout=TIMEOUT)
+        caller = session or requests
+        r = caller.get(API_URL, params=params, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         return r.json().get("results", [])
     except Exception:
         return []
 
-def best_etab(result, cp_cible, siret_cible=""):
-    etabs = result.get("matching_etablissements") or []
+
+def best_etab(result: dict, cp_cible: str, siret_cible: str = "") -> dict:
+    """Choisit l'établissement le plus pertinent dans un résultat API."""
     siege = result.get("siege") or {}
+    # Parenthèses explicites : priorité correcte même si siege est falsy
+    etabs = result.get("matching_etablissements") or ([siege] if siege else [])
     if not etabs:
-        etabs = [siege] if siege else []
+        return siege
 
     if siret_cible:
         for e in etabs:
-            if clean_siret(e.get("siret","")) == siret_cible:
+            if clean_siret(e.get("siret", "")) == siret_cible:
                 return e
 
     cpn = clean_cp(cp_cible)
     if cpn:
-        flt = [e for e in etabs if clean_cp(e.get("code_postal","")) == cpn]
+        flt = [e for e in etabs if clean_cp(e.get("code_postal", "")) == cpn]
         if flt:
             etabs = flt
 
     for e in etabs:
         if e.get("est_siege"):
             return e
-    return etabs[0] if etabs else siege
+    return etabs[0]
 
-def build_adr(etab):
-    parts = [str(etab.get(k,"") or "").strip()
-             for k in ("numero_voie","type_voie","libelle_voie")]
-    adr = " ".join(p for p in parts if p)
-    return (adr or str(etab.get("adresse","") or "")).upper()
 
-def enrich_row(row):
-    intitule  = str(row.get("intitule","") or "").strip()
-    adresse_o = str(row.get("adresse","") or "").strip()
-    cp_o      = clean_cp(row.get("code_postal",""))
-    ville_o   = str(row.get("ville","") or "").strip()
-    siren_o   = clean_siren(row.get("siren",""))
-    siret_o   = clean_siret(row.get("siret",""))
-    mode      = str(row.get("siren_ou_siret","") or "").lower().strip()
+def build_adr(etab: dict) -> str:
+    parts = [str(etab.get(k, "") or "").strip()
+             for k in ("numero_voie", "type_voie", "libelle_voie")]
+    return (" ".join(p for p in parts if p)
+            or str(etab.get("adresse", "") or "")).upper()
 
-    if not intitule:
-        return {}, ""
 
-    candidates = []
+def _score(c: dict, etab: dict, intitule: str, adresse_o: str,
+           cp_o: str, ville_o: str, siren_o: str, siret_o: str) -> float:
+    nom = c.get("nom_complet") or c.get("nom_raison_sociale") or ""
+    score = token_sim(intitule, nom) * 50
 
-    # 1) Par SIRET
-    if siret_o and len(siret_o) == 14:
-        candidates += api_get({"q": siret_o, "per_page": 5})
+    c_siren = clean_siren(c.get("siren", ""))
+    if siren_o and c_siren:
+        score += 40 if c_siren == siren_o else -10
 
-    # 2) Par SIREN
-    if not candidates and siren_o and len(siren_o) == 9:
-        candidates += api_get({"q": siren_o, "per_page": 5})
+    if siret_o:
+        score += 40 if clean_siret(etab.get("siret", "")) == siret_o else 0
 
-    # 3) Par nom + CP
-    if not candidates:
-        p = {"q": intitule, "per_page": 25}
-        if cp_o:
-            p["code_postal"] = cp_o
-        candidates += api_get(p)
+    etab_cp = clean_cp(etab.get("code_postal", ""))
+    if cp_o and etab_cp:
+        if etab_cp == cp_o:           score += 35
+        elif etab_cp[:3] == cp_o[:3]: score += 8
+        elif etab_cp[:2] == cp_o[:2]: score += 3
+        else:                          score -= 25
 
-    # 4) Par nom seul si CP donné mais rien trouvé
-    if not candidates and cp_o:
-        candidates += api_get({"q": intitule, "per_page": 25})
+    ev = etab.get("libelle_commune") or etab.get("commune") or ""
+    if ville_o and ev:
+        score += token_sim(ville_o, ev) * 20
+    if adresse_o:
+        score += token_sim(adresse_o, build_adr(etab)) * 10
+    return score
 
-    # 5) Tokens principaux
-    if not candidates:
-        tokens = normalize(intitule).split()
-        if len(tokens) > 1:
-            candidates += api_get({"q": " ".join(tokens[:3]), "per_page": 15})
 
-    if not candidates:
-        return {}, "red"
-
-    best_score  = -999
-    best_result = None
-    best_etab_  = {}
-
-    for c in candidates:
-        nom = c.get("nom_complet") or c.get("nom_raison_sociale") or ""
-        etab = best_etab(c, cp_o, siret_o)
-        score = token_sim(intitule, nom) * 50
-
-        c_siren = clean_siren(c.get("siren",""))
-        if siren_o and c_siren:
-            score += 40 if c_siren == siren_o else -10
-        c_siret = clean_siret(etab.get("siret",""))
-        if siret_o and c_siret:
-            score += 40 if c_siret == siret_o else 0
-
-        etab_cp = clean_cp(etab.get("code_postal",""))
-        if cp_o and etab_cp:
-            if etab_cp == cp_o:
-                score += 35
-            elif etab_cp[:3] == cp_o[:3]:
-                score += 10
-            elif etab_cp[:2] == cp_o[:2]:
-                score += 5
-            else:
-                score -= 25
-
-        etab_ville = (etab.get("libelle_commune") or etab.get("commune") or "")
-        if ville_o and etab_ville:
-            score += token_sim(ville_o, etab_ville) * 20
-
-        etab_adr = build_adr(etab)
-        if adresse_o and etab_adr:
-            score += token_sim(adresse_o, etab_adr) * 10
-
-        if score > best_score:
-            best_score  = score
-            best_result = c
-            best_etab_  = etab
-
-    if best_result is None or best_score < 8:
-        return {}, "red"
-
-    nom_t   = best_result.get("nom_complet") or best_result.get("nom_raison_sociale") or ""
-    siren_t = clean_siren(best_result.get("siren",""))
-    siret_t = clean_siret(best_etab_.get("siret",""))
-    adr_t   = build_adr(best_etab_)
-    cp_t    = clean_cp(best_etab_.get("code_postal",""))
-    ville_t = (best_etab_.get("libelle_commune") or best_etab_.get("commune") or "").upper()
-
+def _make_enriched(result: dict, etab: dict, mode: str) -> dict:
+    siren_t = clean_siren(result.get("siren", ""))
+    siret_t = clean_siret(etab.get("siret", ""))
     if "siret" in mode:
         out_siren, out_siret = "", siret_t
     elif "siren" in mode:
         out_siren, out_siret = siren_t, ""
     else:
         out_siren, out_siret = siren_t, siret_t
-
-    enriched = {
-        "adresse_trouvee":   adr_t,
+    return {
+        "adresse_trouvee":   build_adr(etab),
         "complement_trouve": "",
-        "cp_trouve":         cp_t,
-        "ville_trouvee":     ville_t,
+        "cp_trouve":         clean_cp(etab.get("code_postal", "")),
+        "ville_trouvee":     (etab.get("libelle_commune") or etab.get("commune") or "").upper(),
         "siren_trouve":      out_siren,
         "siret_trouve":      out_siret,
+        "tva_calcule":       "",
+        "vies_result":       "",
     }
 
-    ok_nom = token_sim(intitule, nom_t) > 0.40
-    if not ok_nom:
-        return enriched, "red"
 
+def enrich_row(row: dict, session: requests.Session = None) -> tuple:
+    """Returns (enriched_dict, status, suggestions_list).
+    status : green | orange | red | suggestion
+    suggestions_list : non-vide si sélection manuelle requise
+    """
+    intitule  = str(row.get("intitule",  "") or "").strip()
+    adresse_o = str(row.get("adresse",   "") or "").strip()
+    cp_o      = clean_cp(row.get("code_postal", ""))
+    ville_o   = str(row.get("ville",     "") or "").strip()
+    siren_o   = clean_siren(row.get("siren",  ""))
+    siret_o   = clean_siret(row.get("siret",  ""))
+    mode      = str(row.get("siren_ou_siret", "") or "").lower().strip()
+
+    if not intitule:
+        return {}, "", []
+
+    has_geo = bool(cp_o or ville_o)
+    get = lambda p: api_get(p, session)
+
+    # ── 1. Récupération des candidats ─────────────────────────────────────
+    candidates: list = []
+    if siret_o and len(siret_o) == 14:
+        candidates = get({"q": siret_o, "per_page": 5})
+    if not candidates and siren_o and len(siren_o) == 9:
+        candidates = get({"q": siren_o, "per_page": 5})
+    if not candidates:
+        p = {"q": intitule, "per_page": 25}
+        if cp_o:
+            p["code_postal"] = cp_o
+        candidates = get(p)
+    if not candidates and cp_o:
+        candidates = get({"q": intitule, "per_page": 25})
+    if not candidates:
+        tokens = normalize(intitule).split()
+        if len(tokens) > 1:
+            candidates = get({"q": " ".join(tokens[:3]), "per_page": 15})
+
+    # ── Fallback scraping si l'API ne donne rien du tout ──────────────────
+    if not candidates:
+        scraped = web_scrape_fallback(intitule, adresse_o, ville_o, cp_o, session)
+        if scraped:
+            return {}, "suggestion", scraped
+        return {}, "red", []
+
+    # ── 2. Résolution des établissements (une seule fois par candidat) ────
+    resolved = [(c, best_etab(c, cp_o, siret_o)) for c in candidates]
+
+    # ── 3. Filtre géo strict ──────────────────────────────────────────────
+    if has_geo:
+        geo_ok = []
+        for c, etab in resolved:
+            cp_match  = (not cp_o)    or clean_cp(etab.get("code_postal", "")) == cp_o
+            vil_match = (not ville_o) or token_sim(
+                ville_o, (etab.get("libelle_commune") or etab.get("commune") or "")) > 0.50
+            if cp_match and vil_match:
+                geo_ok.append((c, etab))
+
+        if not geo_ok:
+            dept = cp_o[:2] if cp_o else ""
+            broad = (get({"q": intitule, "departement": dept, "per_page": 20}) if dept
+                     else get({"q": intitule, "per_page": 20}))
+            # Si la recherche élargie est aussi vide, essai scraping web
+            if not broad:
+                broad = web_scrape_fallback(intitule, adresse_o, ville_o, cp_o, session)
+            return {}, "suggestion", broad[:20]
+
+        resolved = geo_ok
+
+    # ── 4. Scoring ────────────────────────────────────────────────────────
+    best_score, best_c, best_e = -999.0, None, {}
+    for c, etab in resolved:
+        s = _score(c, etab, intitule, adresse_o, cp_o, ville_o, siren_o, siret_o)
+        if s > best_score:
+            best_score, best_c, best_e = s, c, etab
+
+    if best_c is None or best_score < 8:
+        # Même un score faible → proposer en suggestion plutôt que rouge
+        scraped = web_scrape_fallback(intitule, adresse_o, ville_o, cp_o, session)
+        if scraped:
+            return {}, "suggestion", scraped
+        return {}, "red", []
+
+    nom_t    = best_c.get("nom_complet") or best_c.get("nom_raison_sociale") or ""
+    enriched = _make_enriched(best_c, best_e, mode)
+
+    if token_sim(intitule, nom_t) < 0.40:
+        # Similarité insuffisante → proposer en suggestion
+        scraped = web_scrape_fallback(intitule, adresse_o, ville_o, cp_o, session)
+        if scraped:
+            return enriched, "suggestion", scraped
+        return enriched, "red", []
+
+    # ── 5. Statut final ───────────────────────────────────────────────────
     checks = []
-    if cp_o:      checks.append(cp_t == cp_o)
-    if ville_o:   checks.append(token_sim(ville_o, ville_t) > 0.5)
-    if adresse_o: checks.append(token_sim(adresse_o, adr_t) > 0.3)
-    if siren_o:   checks.append(siren_t == siren_o)
-    if siret_o:   checks.append(siret_t == siret_o)
-
-    status = ("green" if (checks and all(checks)) else "orange")
-    return enriched, status
+    if cp_o:      checks.append(enriched["cp_trouve"] == cp_o)
+    if ville_o:   checks.append(token_sim(ville_o, enriched["ville_trouvee"]) > 0.5)
+    if adresse_o: checks.append(token_sim(adresse_o, enriched["adresse_trouvee"]) > 0.3)
+    if siren_o:   checks.append(enriched["siren_trouve"] == siren_o)
+    if siret_o:   checks.append(enriched["siret_trouve"] == siret_o)
+    return enriched, ("green" if checks and all(checks) else "orange"), []
 
 
+def apply_suggestion(candidate: dict, cp_o: str, mode: str) -> dict:
+    """Construit enriched depuis un candidat choisi manuellement, respecte le CP."""
+    etab = best_etab(candidate, cp_o)
+    return _make_enriched(candidate, etab, mode)
+
+
+# ── Fallback scraping web ─────────────────────────────────────────────────────
+# Utilisé quand l'API SIRENE ne trouve rien (red) ou que la liste suggestion
+# est vide après filtre géo.
+_RE_SIREN_PATTERN = re.compile(r'\b(\d{3}[\s.\-]?\d{3}[\s.\-]?\d{3})\b')
+_SCRAPE_URLS = [
+    # DuckDuckGo HTML (sans API key, résultats FR)
+    ("https://html.duckduckgo.com/html/", {"kl": "fr-fr"}),
+    # Bing (fallback)
+    ("https://www.bing.com/search", {"setlang": "fr", "cc": "FR"}),
+]
+
+
+def web_scrape_fallback(intitule: str, adresse: str = "", ville: str = "",
+                        cp: str = "", session: requests.Session = None) -> list:
+    """
+    Cherche des SIRENs via scraping web, puis valide sur l'API SIRENE.
+    Appelé quand l'API ne renvoie rien (red) ou liste suggestion vide.
+    """
+    caller = session or requests
+    hdrs   = {**HEADERS, "Accept-Language": "fr-FR,fr;q=0.9",
+              "Accept": "text/html,application/xhtml+xml"}
+
+    # ── Construction de la requête ────────────────────────────────────────
+    parts = [intitule]
+    if ville: parts.append(ville)
+    if cp:    parts.append(cp)
+    if adresse: parts.append(adresse.split()[0] if adresse.split() else "")
+    query_siren = " ".join(p for p in parts if p) + " SIREN"
+
+    # ── 1. Extraction de SIRENs via scraping ─────────────────────────────
+    sirens: set = set()
+    for base_url, extra_params in _SCRAPE_URLS:
+        if len(sirens) >= 10:
+            break
+        try:
+            resp = caller.get(
+                base_url,
+                params={"q": query_siren, **extra_params},
+                headers=hdrs, timeout=10
+            )
+            if resp.ok:
+                raw = _RE_SIREN_PATTERN.findall(resp.text)
+                for m in raw:
+                    s = _RE_DIGITS_ONLY.sub("", m)
+                    if len(s) == 9 and s not in sirens:
+                        # Filtre grossier : commence par un chiffre plausible
+                        # (les SIRENs commencent par 1-9)
+                        if s[0] != "0":
+                            sirens.add(s)
+        except Exception:
+            continue
+
+    # ── 2. Validation des SIRENs sur l'API SIRENE ─────────────────────────
+    candidates: list = []
+    seen_siren: set  = set()
+    for siren in list(sirens)[:12]:
+        hits = api_get({"q": siren, "per_page": 3}, session)
+        for h in hits:
+            s = h.get("siren", "")
+            if s not in seen_siren:
+                seen_siren.add(s)
+                candidates.append(h)
+        if len(candidates) >= 15:
+            break
+
+    # ── 3. Fallback : recherche textuelle large si aucun SIREN extrait ────
+    if not candidates:
+        tokens = normalize(intitule).split()
+        for n in range(min(len(tokens), 4), 0, -1):
+            hits = api_get({"q": " ".join(tokens[:n]), "per_page": 20}, session)
+            if hits:
+                candidates.extend(hits)
+                break
+
+    # ── 4. Tri par similarité avec l'intitulé ─────────────────────────────
+    candidates.sort(
+        key=lambda c: token_sim(
+            intitule, c.get("nom_complet") or c.get("nom_raison_sociale") or ""),
+        reverse=True
+    )
+    return candidates[:20]
+
+
+# ── Helpers openpyxl — objets immuables pré-calculés une fois au niveau module ─
+_XL_THIN        = Side(style="thin", color="E2E5F0")
+_XL_BRD         = Border(left=_XL_THIN, right=_XL_THIN, top=_XL_THIN, bottom=_XL_THIN)
+_XL_ALIGN_HDR   = Alignment(horizontal="center", vertical="center", wrap_text=True)
+_XL_ALIGN_DATA  = Alignment(vertical="center")
+_XL_FONT_HDR_S  = Font(bold=True, name="Calibri", size=10, color="FFFFFF")
+_XL_FONT_HDR_F  = Font(bold=True, name="Calibri", size=10, color="4F6EF7", italic=True)
+_XL_FONT_DATA   = Font(name="Calibri", size=10)
+_XL_FILL_HDR_S  = PatternFill("solid", fgColor="4F6EF7")
+_XL_FILL_HDR_F  = PatternFill("solid", fgColor="EEF1FE")
+_XL_FILLS       = {st: PatternFill("solid", fgColor=fc) for st, fc in _STATUS_FILL.items()}
+
+
+def _xl_style_header(ws, n_src: int):
+    """Applique la mise en forme de la ligne d'en-tête (partagée export + gabarit)."""
+    for ci, cell in enumerate(ws[1], 1):
+        is_src         = ci <= n_src
+        cell.fill      = _XL_FILL_HDR_S if is_src else _XL_FILL_HDR_F
+        cell.font      = _XL_FONT_HDR_S if is_src else _XL_FONT_HDR_F
+        cell.alignment = _XL_ALIGN_HDR
+        cell.border    = _XL_BRD
+    ws.row_dimensions[1].height = 36
+    return _XL_BRD
+
+
+def _xl_style_data_row(ws, excel_row: int, brd, fill=None):
+    for cell in ws[excel_row]:
+        if fill:
+            cell.fill  = fill
+        cell.border    = brd
+        cell.alignment = _XL_ALIGN_DATA
+        cell.font      = _XL_FONT_DATA
+
+
+def _xl_auto_width(ws):
+    for col_idx, col in enumerate(ws.columns, 1):
+        w = max((len(str(c.value or "")) for c in col), default=8)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(w + 2, 10), 50)
+
+
+# ── Popup filtre colonne ──────────────────────────────────────────────────────
+class ColFilterPopup(tk.Toplevel):
+    def __init__(self, parent, col_label, all_values, current_filter, on_change):
+        super().__init__(parent)
+        self.overrideredirect(True)
+        self.configure(bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        self.attributes("-topmost", True)
+        self._on_change = on_change
+        self._col_label = col_label
+        self._unique = sorted(set(str(v) for v in all_values if str(v).strip()))
+        self._checked = {v: tk.BooleanVar(value=(v in current_filter
+                                                  if current_filter is not None else True))
+                         for v in self._unique}
+        self._build()
+        self._bind_id = parent.bind("<Button-1>", self._maybe_close, add=True)
+        self.bind("<Destroy>", lambda e: self._unbind_parent(parent))
+
+    def _unbind_parent(self, parent):
+        try:
+            parent.unbind("<Button-1>", self._bind_id)
+        except Exception:
+            pass
+
+    def _build(self):
+        tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
+        hdr = tk.Frame(self, bg=CARD2)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"Filtrer : {self._col_label}", bg=CARD2, fg=TEXT,
+                 font=("Segoe UI", 9, "bold"), padx=10, pady=6).pack(side="left")
+        tk.Button(hdr, text="✕", bg=CARD2, fg=TEXT3, relief="flat",
+                  font=("Segoe UI", 9), cursor="hand2", padx=8,
+                  command=self.destroy).pack(side="right")
+
+        sf = tk.Frame(self, bg=CARD)
+        sf.pack(fill="x", padx=8, pady=(6, 2))
+        self._sv = tk.StringVar()
+        tk.Entry(sf, textvariable=self._sv, bg=CARD2, fg=TEXT, relief="flat",
+                 font=("Segoe UI", 9), highlightbackground=BORDER,
+                 highlightthickness=1).pack(fill="x", ipady=4, padx=1)
+        self._sv.trace_add("write", lambda *_: self._rebuild())
+
+        top_row = tk.Frame(self, bg=CARD)
+        top_row.pack(fill="x", padx=8, pady=(4, 0))
+        for lbl, cmd in [("✓ Tout", self._all), ("✗ Aucun", self._none)]:
+            tk.Button(top_row, text=lbl, command=cmd, bg=CARD2, fg=TEXT2,
+                      relief="flat", font=("Segoe UI", 8), cursor="hand2",
+                      padx=8, pady=3).pack(side="left", padx=(0, 4))
+
+        list_frame = tk.Frame(self, bg=CARD)
+        list_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        canvas = tk.Canvas(list_frame, bg=CARD, highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self._inner = tk.Frame(canvas, bg=CARD)
+        win = canvas.create_window((0, 0), window=self._inner, anchor="nw")
+        self._inner.bind("<Configure>",
+                         lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+        self._canvas = canvas
+        self._rebuild()
+
+        bf = tk.Frame(self, bg=CARD2)
+        bf.pack(fill="x")
+        tk.Button(bf, text="Effacer", command=self._clear, bg=CARD2, fg=TEXT2,
+                  relief="flat", font=("Segoe UI", 9), cursor="hand2",
+                  pady=7, padx=12).pack(side="left")
+        tk.Button(bf, text="Fermer", command=self.destroy, bg=ACCENT, fg="white",
+                  relief="flat", font=("Segoe UI", 9, "bold"), cursor="hand2",
+                  pady=7, padx=16).pack(side="right", padx=4, pady=4)
+
+    def _rebuild(self):
+        for w in self._inner.winfo_children():
+            w.destroy()
+        txt = self._sv.get().upper()
+        for v in (v for v in self._unique if txt in v.upper()):
+            tk.Checkbutton(self._inner, text=v, variable=self._checked[v],
+                           bg=CARD, fg=TEXT, font=("Segoe UI", 9), anchor="w",
+                           activebackground=CARD2, selectcolor=CARD2,
+                           command=self._live).pack(fill="x", padx=4, pady=1)
+        self._canvas.update_idletasks()
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _live(self):
+        sel = {v for v, var in self._checked.items() if var.get()}
+        self._on_change(self._col_label,
+                        None if len(sel) == len(self._unique) else sel)
+
+    def _all(self):
+        for var in self._checked.values():
+            var.set(True)
+        self._on_change(self._col_label, None)
+        self._rebuild()
+
+    def _none(self):
+        for var in self._checked.values():
+            var.set(False)
+        self._on_change(self._col_label, set())
+        self._rebuild()
+
+    def _clear(self):
+        self._on_change(self._col_label, None)
+        self.destroy()
+
+    def _maybe_close(self, event):
+        try:
+            if not str(event.widget).startswith(str(self)):
+                self.after(250, self._safe_destroy)
+        except Exception:
+            pass
+
+    def _safe_destroy(self):
+        try:
+            if self.winfo_exists():
+                self.destroy()
+        except Exception:
+            pass
+
+
+# ── Panneau visibilité colonnes ───────────────────────────────────────────────
+class ColVisPanel(tk.Toplevel):
+    def __init__(self, parent, visibility, on_toggle):
+        super().__init__(parent)
+        self.overrideredirect(True)
+        self.configure(bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        self.attributes("-topmost", True)
+
+        tk.Frame(self, bg=ACCENT, height=3).pack(fill="x")
+        hdr = tk.Frame(self, bg=CARD2)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="⊞  Colonnes visibles", bg=CARD2, fg=TEXT,
+                 font=("Segoe UI", 9, "bold"), padx=10, pady=7).pack(side="left")
+        tk.Button(hdr, text="✕", bg=CARD2, fg=TEXT3, relief="flat",
+                  font=("Segoe UI", 9), cursor="hand2", padx=8,
+                  command=self.destroy).pack(side="right")
+
+        body = tk.Frame(self, bg=CARD)
+        body.pack(fill="both", expand=True, padx=10, pady=8)
+        for label, *_ in COLS_DEF:
+            var = tk.BooleanVar(value=visibility.get(label, True))
+            tk.Checkbutton(body, text=label, variable=var,
+                           bg=CARD, fg=TEXT, font=("Segoe UI", 9), anchor="w",
+                           activebackground=CARD2, selectcolor=CARD2,
+                           command=lambda l=label, v=var: on_toggle(l, v.get())
+                           ).pack(fill="x", padx=4, pady=2)
+
+        tk.Button(self, text="Fermer", command=self.destroy,
+                  bg=ACCENT, fg="white", relief="flat",
+                  font=("Segoe UI", 9, "bold"), cursor="hand2",
+                  pady=7, padx=16).pack(pady=(0, 8), padx=10, anchor="e")
+        self._bind_id = parent.bind("<Button-1>", self._maybe_close, add=True)
+        self.bind("<Destroy>", lambda e: self._unbind_parent(parent))
+
+    def _unbind_parent(self, parent):
+        try:
+            parent.unbind("<Button-1>", self._bind_id)
+        except Exception:
+            pass
+
+    def _maybe_close(self, event):
+        try:
+            if not str(event.widget).startswith(str(self)):
+                self.after(250, self._safe_destroy)
+        except Exception:
+            pass
+
+    def _safe_destroy(self):
+        try:
+            if self.winfo_exists():
+                self.destroy()
+        except Exception:
+            pass
+
+
+# ── Fenêtre suggestions ───────────────────────────────────────────────────────
+class SuggestionWindow(tk.Toplevel):
+    """
+    Fenêtre modale de sélection manuelle d'un candidat.
+    Garanties :
+      - Une seule instance par ligne (gérée par App._suggestion_win)
+      - Modale (grab_set) : bloque l'interaction parent pendant la sélection
+      - Double-clic OU bouton "Appliquer" pour valider
+      - Bouton "Ignorer" pour passer sans rien choisir
+    """
+    def __init__(self, parent, intitule, cp_orig, ville_orig, candidates, on_pick):
+        super().__init__(parent)
+        self.title(f"Suggestions — {intitule[:60]}")
+        self.geometry("860x520")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.transient(parent)   # reste au-dessus du parent
+        self._candidates = candidates
+        self._on_pick    = on_pick
+        self._tree_ref   = None  # référence au Treeview interne
+
+        self._build(intitule, cp_orig, ville_orig)
+
+        self.lift()
+        self.grab_set()          # modal : bloque le reste de l'UI
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.bind("<Escape>", lambda e: self._on_cancel())
+
+    def _build(self, intitule, cp_orig, ville_orig):
+        tk.Frame(self, bg=PURPLE, height=4).pack(fill="x")
+
+        hdr = tk.Frame(self, bg=CARD)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"🔍  Suggestions pour  «{intitule}»",
+                 bg=CARD, fg=TEXT, font=("Segoe UI", 11, "bold"),
+                 pady=12, padx=16).pack(side="left")
+        zone = f"{cp_orig} {ville_orig}".strip()
+        if zone:
+            tk.Label(hdr, text=f"Zone d'origine : {zone}",
+                     bg=CARD, fg=TEXT2, font=("Segoe UI", 9), padx=16).pack(side="right")
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+        info = tk.Frame(self, bg=PURPLE_BG)
+        info.pack(fill="x", padx=14, pady=(8, 4))
+        tk.Label(info,
+                 text="⚠  Aucun résultat exact trouvé dans la zone demandée. "
+                      "Sélectionnez une ligne puis cliquez «Appliquer», ou double-cliquez.",
+                 bg=PURPLE_BG, fg=PURPLE, font=("Segoe UI", 8, "bold"),
+                 wraplength=820, justify="left", padx=10, pady=6).pack(anchor="w")
+
+        # ── Tableau des suggestions ──────────────────────────────────────
+        tf = tk.Frame(self, bg=BG)
+        tf.pack(fill="both", expand=True, padx=14, pady=(4, 0))
+
+        cols   = ("Nom", "SIREN", "Adresse", "CP", "Ville", "Activité")
+        widths = (210,    90,      220,       60,   130,     150)
+        tree   = ttk.Treeview(tf, columns=cols, show="headings", selectmode="browse")
+        for c, w in zip(cols, widths):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="w", minwidth=40)
+
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=tree.yview)
+        tree.configure(yscroll=vsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        tf.rowconfigure(0, weight=1)
+        tf.columnconfigure(0, weight=1)
+
+        for i, c in enumerate(self._candidates[:20]):
+            nom  = c.get("nom_complet") or c.get("nom_raison_sociale") or "—"
+            siren = c.get("siren", "")
+            etab  = best_etab(c, cp_orig)   # tient compte du CP d'origine
+            tree.insert("", "end", iid=str(i),
+                        values=(nom, siren, build_adr(etab),
+                                clean_cp(etab.get("code_postal", "")),
+                                (etab.get("libelle_commune") or "").upper(),
+                                str(c.get("activite_principale", "") or "")[:35]))
+
+        self._tree_ref = tree
+        tree.bind("<Double-1>",  self._on_tree_dbl)
+        tree.bind("<Return>",    lambda e: self._apply())
+
+        # ── Barre de boutons ─────────────────────────────────────────────
+        bf = tk.Frame(self, bg=CARD2)
+        bf.pack(fill="x", pady=(6, 0))
+
+        tk.Label(bf, text="Sélectionnez une ligne et cliquez Appliquer",
+                 bg=CARD2, fg=TEXT3, font=("Segoe UI", 8),
+                 padx=16, pady=8).pack(side="left")
+
+        tk.Button(bf, text="Annuler / Ignorer", command=self._on_cancel,
+                  bg=CARD2, fg=TEXT2, relief="flat", font=("Segoe UI", 9),
+                  cursor="hand2", padx=14, pady=8).pack(side="right", padx=4, pady=6)
+
+        tk.Button(bf, text="✔  Appliquer", command=self._apply,
+                  bg=ACCENT, fg="white", relief="flat",
+                  font=("Segoe UI", 9, "bold"), cursor="hand2",
+                  padx=16, pady=8).pack(side="right", padx=8, pady=6)
+
+    def _get_selected_idx(self) -> int | None:
+        """Retourne l'index candidat sélectionné, ou None."""
+        if self._tree_ref is None:
+            return None
+        sel = self._tree_ref.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _on_tree_dbl(self, event):
+        """Double-clic : vérifie que c'est bien une cellule (pas un en-tête)."""
+        region = self._tree_ref.identify_region(event.x, event.y)
+        if region not in ("cell", "tree"):
+            return
+        self._apply()
+
+    def _apply(self):
+        idx = self._get_selected_idx()
+        if idx is None:
+            messagebox.showwarning("Aucune sélection",
+                                   "Veuillez sélectionner une ligne.",
+                                   parent=self)
+            return
+        if idx < len(self._candidates):
+            try:
+                self._on_pick(self._candidates[idx])
+            except Exception as e:
+                messagebox.showerror("Erreur", str(e), parent=self)
+                return
+        self._close()
+
+    def _on_cancel(self):
+        self._close()
+
+    def _close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+
+# ── Application ───────────────────────────────────────────────────────────────
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Enrichissement Tiers – SIRENE")
-        self.geometry("1440x840")
-        self.minsize(980, 620)
+        self.title("Aide RFE")
+        self.geometry("1560x900")
+        self.minsize(1100, 650)
         self.configure(bg=BG)
-        self.df        = None
-        self.col_index = {}
-        self.filepath  = None
-        self.results   = []
-        self.q         = queue.Queue()
-        self._running  = False
-        self._sort_state = {}
+
+        # ── État ──
+        self.df             = None
+        self.col_index      = {}
+        self.results        = []        # list[None | {enriched, status, suggestions}]
+        self._row_cache     = []        # list[dict] — synchronized avec self.df
+        self._cache_dirty   = set()     # indices à reconstruire
+        self._counts        = {"green": 0, "orange": 0, "red": 0, "suggestion": 0, "pending": 0}  # stats incrémentales
+        self._done_count    = 0         # nb de lignes traitées (O(1) progress)
+        self.q              = queue.Queue()
+        self._running       = False
+        self._sort_col      = None
+        self._sort_rev      = False
+        self._col_filters   = {}        # col_label -> set | None
+        self._col_visible   = dict(DEFAULT_VISIBLE)
+        self._open_popup    = None
+        self._suggestion_win= None      # unique SuggestionWindow ouverte
+        self._sugg_guard    = False     # empêche _on_dbl_click si suggestion déjà ouverte
+        self._debounce_id   = None      # après(..) id pour debounce recherche
+
         self._build_styles()
         self._build_ui()
         self.after(80, self._poll_queue)
 
+    # ── Styles ──────────────────────────────────────────────────────────────
     def _build_styles(self):
         s = ttk.Style(self)
         s.theme_use("clam")
         s.configure("prog.Horizontal.TProgressbar",
-                    troughcolor=CARD, background=ACCENT, borderwidth=0, thickness=8)
+                    troughcolor=CARD2, background=ACCENT, borderwidth=0, thickness=6)
         s.configure("Treeview",
                     background=CARD, foreground=TEXT, fieldbackground=CARD,
-                    rowheight=28, borderwidth=0, font=("Segoe UI", 9))
+                    rowheight=30, borderwidth=0, font=("Segoe UI", 9))
         s.configure("Treeview.Heading",
-                    background=PANEL, foreground=ACCENT, borderwidth=0,
-                    font=("Segoe UI", 9, "bold"), padding=(6, 6))
+                    background=CARD2, foreground=TEXT, borderwidth=0,
+                    font=("Segoe UI", 9, "bold"), padding=(6, 7), relief="flat")
         s.map("Treeview",
-              background=[("selected", ACCENT)],
-              foreground=[("selected", "white")])
+              background=[("selected", ACCENT_L)],
+              foreground=[("selected", ACCENT)])
+        s.map("Treeview.Heading", background=[("active", ACCENT_L)])
+        s.configure("TScrollbar", troughcolor=BG, background=CARD,
+                    borderwidth=0, arrowcolor=TEXT3)
 
+    # ── Build UI ────────────────────────────────────────────────────────────
     def _build_ui(self):
-        # Sidebar
-        sb = tk.Frame(self, bg=PANEL, width=235)
+        # ── Sidebar ──────────────────────────────────────────────────────
+        sb = tk.Frame(self, bg=SIDEBAR, width=232)
         sb.pack(side="left", fill="y")
         sb.pack_propagate(False)
+        tk.Frame(sb, bg=BORDER, width=1).pack(side="right", fill="y")
 
-        tk.Label(sb, text="🔍", bg=PANEL, fg=ACCENT,
-                 font=("Segoe UI", 30)).pack(pady=(28,4))
-        tk.Label(sb, text="Enrichissement Tiers",
-                 bg=PANEL, fg=TEXT, font=("Segoe UI", 12, "bold"),
-                 justify="center").pack()
-        tk.Label(sb, text="SIRENE · data.gouv.fr",
-                 bg=PANEL, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(pady=(2,20))
+        lf = tk.Frame(sb, bg=SIDEBAR)
+        lf.pack(fill="x", pady=(22, 14), padx=18)
+        tk.Label(lf, text="⬡", bg=SIDEBAR, fg=ACCENT,
+                 font=("Segoe UI", 22)).pack(side="left")
+        t = tk.Frame(lf, bg=SIDEBAR)
+        t.pack(side="left", padx=10)
+        tk.Label(t, text="Aide RFE", bg=SIDEBAR, fg=TEXT,
+                 font=("Segoe UI", 13, "bold")).pack(anchor="w")
 
-        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=18, pady=4)
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=16, pady=2)
+        self._btn_import = self._sbtn(sb, "📂  Importer Excel",    self._import)
+        self._sbtn(sb, "📋  Gabarit Excel", self._export_template,
+                   bg=CARD2, fg=TEXT2, hover="#E4E7F5")
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=16, pady=6)
+        self._btn_search = self._sbtn(sb, "🚀  Lancer Recherche", self._start_search,
+                                      state="disabled")
+        self._btn_tva    = self._sbtn(sb, "🧮  Calculer N° TVA",  self._compute_tva_all,
+                                      state="disabled", bg=PURPLE_BG, fg=PURPLE,
+                                      hover="#DDD6FE")
+        self._btn_vies   = self._sbtn(sb, "🇪🇺  Vérification VIES", self._verify_vies_all,
+                                      state="disabled", bg="#EFF6FF", fg="#1D4ED8",
+                                      hover="#DBEAFE")
+        self._btn_stop   = self._sbtn(sb, "⏹  Arrêter",          self._stop,
+                                      bg=RED_BG, fg=RED, hover="#FECACA",
+                                      state="disabled")
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=16, pady=6)
+        self._btn_export = self._sbtn(sb, "💾  Exporter résultats", self._export,
+                                      state="disabled")
 
-        self._btn_import = self._sbtn(sb, "📂  Importer Excel",   self._import)
-        self._btn_search = self._sbtn(sb, "🚀  Lancer Recherche", self._start_search, state="disabled")
-        self._btn_stop   = self._sbtn(sb, "⏹  Arrêter",          self._stop,         state="disabled", fg=RED_C)
-        self._btn_export = self._sbtn(sb, "💾  Exporter Excel",   self._export,       state="disabled", fg=ACCENT2)
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=16, pady=10)
+        tk.Label(sb, text="LÉGENDE", bg=SIDEBAR, fg=TEXT3,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=18, pady=(2, 6))
+        for col, bg, lbl in [(GREEN, GREEN_BG, "Tout correspond"),
+                              (ORANGE, ORANGE_BG, "Correspondance partielle"),
+                              (PURPLE, PURPLE_BG, "Suggestion manuelle requise"),
+                              (RED, RED_BG, "Non trouvé")]:
+            f = tk.Frame(sb, bg=SIDEBAR)
+            f.pack(fill="x", padx=16, pady=2)
+            tk.Label(f, text=lbl, bg=bg, fg=col,
+                     font=("Segoe UI", 8, "bold"), padx=8, pady=3).pack(side="left")
 
-        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=18, pady=16)
+        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=16, pady=10)
+        sg = tk.Frame(sb, bg=SIDEBAR)
+        sg.pack(fill="x", padx=12)
+        sg.columnconfigure((0, 1), weight=1)
+        self._sc_total  = self._mkstat(sg, "Total",  "0", TEXT,   "📄", 0, 0)
+        self._sc_green  = self._mkstat(sg, "Vert",   "0", GREEN,  "✅", 0, 1)
+        self._sc_orange = self._mkstat(sg, "Orange", "0", ORANGE, "🟠", 1, 0)
+        self._sc_red    = self._mkstat(sg, "Rouge",  "0", RED,    "❌", 1, 1)
+        sg2 = tk.Frame(sb, bg=SIDEBAR)
+        sg2.pack(fill="x", padx=12)
+        sg2.columnconfigure((0,1), weight=1)
+        self._sc_sugg   = self._mkstat(sg2, "Suggestion", "0", PURPLE, "🔍", 0, 0)
+        self._sc_pend   = self._mkstat(sg2, "En attente", "0", TEXT3,  "⏳", 0, 1)
 
-        for icon, col, lbl in [("●",GREEN,"Tout matche"),("●",ORANGE,"Partiel / nom seul"),("●",RED_C,"Non trouvé")]:
-            f = tk.Frame(sb, bg=PANEL)
-            f.pack(fill="x", padx=18, pady=3)
-            tk.Label(f, text=icon, bg=PANEL, fg=col, font=("Segoe UI",14)).pack(side="left")
-            tk.Label(f, text=f"  {lbl}", bg=PANEL, fg=TEXT_DIM, font=("Segoe UI",9)).pack(side="left")
-
-        tk.Frame(sb, bg=BORDER, height=1).pack(fill="x", padx=18, pady=16)
-
-        self._lbl_total  = self._sstat(sb, "Lignes",       "0", TEXT)
-        self._lbl_green  = self._sstat(sb, "✅ Vert",      "0", GREEN)
-        self._lbl_orange = self._sstat(sb, "🟠 Orange",    "0", ORANGE)
-        self._lbl_red    = self._sstat(sb, "❌ Rouge",     "0", RED_C)
-        self._lbl_pend   = self._sstat(sb, "⏳ En attente","0", TEXT_DIM)
-
-        # Main
+        # ── Main ──────────────────────────────────────────────────────────
         main = tk.Frame(self, bg=BG)
         main.pack(side="right", fill="both", expand=True)
 
-        # Top bar
-        top = tk.Frame(main, bg=PANEL, height=52)
+        top = tk.Frame(main, bg=CARD, height=52)
         top.pack(fill="x")
         top.pack_propagate(False)
-
+        tk.Frame(top, bg=BORDER, height=1).pack(side="bottom", fill="x")
         self._lbl_file = tk.Label(top, text="Aucun fichier chargé",
-                                  bg=PANEL, fg=TEXT_DIM, font=("Segoe UI",10))
-        self._lbl_file.pack(side="left", padx=20, pady=14)
+                                  bg=CARD, fg=TEXT2, font=("Segoe UI", 10))
+        self._lbl_file.pack(side="left", padx=18, pady=14)
 
-        flt = tk.Frame(top, bg=PANEL)
-        flt.pack(side="right", padx=20)
-        tk.Label(flt, text="Filtre :", bg=PANEL, fg=TEXT_DIM,
-                 font=("Segoe UI",9)).pack(side="left", pady=14)
-        self._filter_var = tk.StringVar(value="Tous")
-        cb = ttk.Combobox(flt, textvariable=self._filter_var,
-                          values=["Tous","Vert","Orange","Rouge","En attente"],
-                          state="readonly", width=12, font=("Segoe UI",9))
-        cb.pack(side="left", padx=8, pady=14)
-        cb.bind("<<ComboboxSelected>>", lambda _: self._refresh_table())
+        pf = tk.Frame(top, bg=CARD)
+        pf.pack(side="right", padx=14)
+        tk.Label(pf, text="Afficher :", bg=CARD, fg=TEXT3,
+                 font=("Segoe UI", 9)).pack(side="left", pady=14)
+        self._quick_filter = tk.StringVar(value="Tous")
+        self._pill_ws = {}
+        for lbl in ["Tous", "Vert", "Orange", "Suggestion", "Rouge", "En attente"]:
+            self._mkpill(pf, lbl)
 
-        # Search bar
-        sbar = tk.Frame(main, bg=CARD)
-        sbar.pack(fill="x", padx=16, pady=(10,0))
-        tk.Label(sbar, text="🔎", bg=CARD, fg=TEXT_DIM,
-                 font=("Segoe UI",12)).pack(side="left", padx=8)
+        tb = tk.Frame(main, bg=CARD2, height=38)
+        tb.pack(fill="x")
+        tb.pack_propagate(False)
+        tk.Frame(tb, bg=BORDER, height=1).pack(side="bottom", fill="x")
+
+        sel_f = tk.Frame(tb, bg=CARD2)
+        sel_f.pack(side="left", padx=12)
+        tk.Label(sel_f, text="Sélection :", bg=CARD2, fg=TEXT3,
+                 font=("Segoe UI", 8)).pack(side="left", pady=8)
+        for lbl, cmd in [("Tout sélectionner", self._check_all),
+                          ("Tout désélectionner", self._check_none),
+                          ("Rechercher la sélection", self._search_checked)]:
+            tk.Button(sel_f, text=lbl, command=cmd, bg=CARD, fg=TEXT2,
+                      relief="flat", font=("Segoe UI", 8), cursor="hand2",
+                      padx=10, pady=3, highlightbackground=BORDER,
+                      highlightthickness=1).pack(side="left", padx=4, pady=6)
+        self._lbl_sel = tk.Label(sel_f, text="0 sélectionné(s)",
+                                 bg=CARD2, fg=ACCENT, font=("Segoe UI", 8, "bold"))
+        self._lbl_sel.pack(side="left", padx=8)
+        tk.Label(sel_f,
+                 text="  Clic = sélectionner · Shift+clic = plage · Ctrl+clic = ajouter",
+                 bg=CARD2, fg=TEXT3, font=("Segoe UI", 7)).pack(side="left", padx=6)
+        tk.Button(tb, text="⊞  Colonnes", command=self._open_col_vis,
+                  bg=CARD, fg=ACCENT, relief="flat",
+                  font=("Segoe UI", 9, "bold"), cursor="hand2",
+                  padx=12, pady=3, highlightbackground=BORDER,
+                  highlightthickness=1).pack(side="right", padx=12, pady=6)
+
+        sr = tk.Frame(main, bg=BG)
+        sr.pack(fill="x", padx=18, pady=(10, 4))
+        sbox = tk.Frame(sr, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        sbox.pack(side="left", fill="x", expand=True)
+        tk.Label(sbox, text="🔎", bg=CARD, fg=TEXT3,
+                 font=("Segoe UI", 11)).pack(side="left", padx=10, pady=7)
         self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", lambda *_: self._refresh_table())
-        tk.Entry(sbar, textvariable=self._search_var,
-                 bg=CARD, fg=TEXT, insertbackground=TEXT,
-                 relief="flat", font=("Segoe UI",10), bd=0).pack(
-                     side="left", fill="x", expand=True, pady=8)
+        self._search_var.trace_add("write", self._on_search_change)
+        tk.Entry(sbox, textvariable=self._search_var, bg=CARD, fg=TEXT,
+                 insertbackground=TEXT, relief="flat",
+                 font=("Segoe UI", 10), bd=0).pack(side="left", fill="x",
+                                                    expand=True, pady=7, padx=4)
+        self._lbl_flt = tk.Label(sbox, text="", bg=CARD, fg=ACCENT,
+                                 font=("Segoe UI", 8, "bold"))
+        self._lbl_flt.pack(side="right", padx=6)
+        tk.Button(sbox, text="✕  Effacer tout", command=self._clear_all_filters,
+                  bg=CARD, fg=TEXT3, relief="flat", font=("Segoe UI", 8),
+                  cursor="hand2", activebackground=CARD2,
+                  pady=7, padx=10).pack(side="right")
 
-        # Progress
-        prog = tk.Frame(main, bg=BG)
-        prog.pack(fill="x", padx=16, pady=(8,0))
-        self._lbl_progress = tk.Label(prog, text="", bg=BG, fg=TEXT_DIM,
-                                      font=("Segoe UI",9), anchor="w")
-        self._lbl_progress.pack(side="left", fill="x", expand=True)
-        self._progress = ttk.Progressbar(prog, style="prog.Horizontal.TProgressbar",
-                                          mode="determinate", length=380)
-        self._progress.pack(side="right", pady=4)
+        pr = tk.Frame(main, bg=BG)
+        pr.pack(fill="x", padx=18, pady=(0, 4))
+        self._lbl_prog = tk.Label(pr, text="", bg=BG, fg=TEXT2,
+                                  font=("Segoe UI", 9), anchor="w")
+        self._lbl_prog.pack(side="left", fill="x", expand=True)
+        self._progress = ttk.Progressbar(pr, style="prog.Horizontal.TProgressbar",
+                                          mode="determinate", length=280)
+        self._progress.pack(side="right", pady=2)
 
-        # Table
-        tbl = tk.Frame(main, bg=BG)
-        tbl.pack(fill="both", expand=True, padx=16, pady=10)
-
-        COLS = ("Intitulé","CP","Ville","SIREN","SIRET","Mode",
-                "Adresse trouvée","CP trouvé","Ville trouvée",
-                "SIREN trouvé","SIRET trouvé","Statut")
-        self._tree = ttk.Treeview(tbl, columns=COLS, show="headings", selectmode="browse")
-        WIDTHS = [170,60,120,100,130,65,200,65,130,100,130,90]
-        for col, w in zip(COLS, WIDTHS):
-            self._tree.heading(col, text=col,
-                               command=lambda c=col: self._sort_by(c))
-            self._tree.column(col, width=w, anchor="w", minwidth=40)
-
-        self._tree.tag_configure("green",   background="#152B1E", foreground=GREEN)
-        self._tree.tag_configure("orange",  background="#2E2210", foreground=ORANGE)
-        self._tree.tag_configure("red",     background="#2B1515", foreground=RED_C)
-        self._tree.tag_configure("pending", background=CARD,      foreground=TEXT_DIM)
-
-        vsb = ttk.Scrollbar(tbl, orient="vertical",   command=self._tree.yview)
-        hsb = ttk.Scrollbar(tbl, orient="horizontal", command=self._tree.xview)
+        # ── Tableau ────────────────────────────────────────────────────────
+        tf = tk.Frame(main, bg=BG)
+        tf.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+        self._tree = ttk.Treeview(tf, columns=ALL_COL_LABELS,
+                                   show="headings", selectmode="extended")
+        for lbl, w in zip(ALL_COL_LABELS, ALL_COL_WIDTHS):
+            self._tree.heading(lbl, text=f"{lbl}  ▾",
+                               command=lambda c=lbl: self._header_click(c))
+            self._tree.column(lbl, width=w, anchor="w", minwidth=20)
+        self._tree.tag_configure("green",      background=GREEN_BG,  foreground=GREEN)
+        self._tree.tag_configure("orange",     background=ORANGE_BG, foreground=ORANGE)
+        self._tree.tag_configure("red",        background=RED_BG,    foreground=RED)
+        self._tree.tag_configure("suggestion", background=PURPLE_BG, foreground=PURPLE)
+        self._tree.tag_configure("pending",    background=CARD,      foreground=TEXT3)
+        vsb = ttk.Scrollbar(tf, orient="vertical",   command=self._tree.yview)
+        hsb = ttk.Scrollbar(tf, orient="horizontal", command=self._tree.xview)
         self._tree.configure(yscroll=vsb.set, xscroll=hsb.set)
         self._tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        tbl.rowconfigure(0, weight=1)
-        tbl.columnconfigure(0, weight=1)
-        self._tree.bind("<Double-1>", self._show_detail)
+        tf.rowconfigure(0, weight=1)
+        tf.columnconfigure(0, weight=1)
+        self._tree.bind("<Button-1>",         self._on_click)
+        self._tree.bind("<Double-1>",         self._on_dbl_click)
+        self._tree.bind("<Button-3>",         self._ctx_menu)
+        self._tree.bind("<<TreeviewSelect>>", self._on_selection_change)
+        self._apply_displaycols()
 
-        self._status = tk.Label(main, text="Prêt — Importez un fichier Excel pour commencer.",
-                                bg=PANEL, fg=TEXT_DIM, font=("Segoe UI",9),
-                                anchor="w", padx=14, pady=7)
-        self._status.pack(fill="x", side="bottom")
+        self._statusbar = tk.Label(main,
+            text="Prêt — Cochez les lignes souhaitées, lancez la recherche, puis exportez.",
+            bg=CARD, fg=TEXT2, font=("Segoe UI", 9), anchor="w",
+            padx=18, pady=6, highlightbackground=BORDER, highlightthickness=1)
+        self._statusbar.pack(fill="x", side="bottom")
 
-    def _sbtn(self, p, text, cmd, state="normal", fg=ACCENT):
-        b = tk.Button(p, text=text, command=cmd, state=state,
-                      bg=CARD, fg=fg, activebackground=ACCENT,
-                      activeforeground="white", font=("Segoe UI",10,"bold"),
-                      relief="flat", cursor="hand2", pady=10, padx=14,
-                      anchor="w", bd=0, highlightthickness=0)
-        b.pack(fill="x", padx=14, pady=3)
+    # ── Widget helpers ───────────────────────────────────────────────────────
+    def _sbtn(self, parent, text, cmd, bg=ACCENT, fg="white",
+              hover=ACCENT_H, state="normal"):
+        f = tk.Frame(parent, bg=SIDEBAR)
+        f.pack(fill="x", padx=14, pady=3)
+        b = tk.Label(f, text=text,
+                     bg=bg if state == "normal" else CARD2,
+                     fg=fg if state == "normal" else TEXT3,
+                     font=("Segoe UI", 10, "bold"), anchor="w",
+                     padx=14, pady=9,
+                     cursor="hand2" if state == "normal" else "arrow")
+        b.pack(fill="x")
+        b._bg = bg; b._hover = hover; b._fg = fg; b._cmd = cmd
+        b._en = (state == "normal")
+        b.bind("<Enter>",    lambda e: b.config(bg=b._hover) if b._en else None)
+        b.bind("<Leave>",    lambda e: b.config(bg=b._bg)    if b._en else None)
+        b.bind("<Button-1>", lambda e: b._cmd() if b._en else None)
+
+        def _set(en):
+            b._en = en
+            b.config(bg=b._bg if en else CARD2,
+                     fg=b._fg if en else TEXT3,
+                     cursor="hand2" if en else "arrow")
+        b.config_state = _set
         return b
 
-    def _sstat(self, p, label, val, color):
-        f = tk.Frame(p, bg=PANEL)
-        f.pack(fill="x", padx=18, pady=2)
-        tk.Label(f, text=label, bg=PANEL, fg=TEXT_DIM,
-                 font=("Segoe UI",9)).pack(side="left")
-        lbl = tk.Label(f, text=val, bg=PANEL, fg=color,
-                       font=("Segoe UI",9,"bold"))
-        lbl.pack(side="right")
-        return lbl
+    def _mkstat(self, parent, label, val, color, icon, row, col):
+        f = tk.Frame(parent, bg=CARD, padx=10, pady=8,
+                     highlightbackground=BORDER, highlightthickness=1)
+        f.grid(row=row, column=col, padx=3, pady=3, sticky="ew")
+        tk.Label(f, text=icon, bg=CARD, fg=color, font=("Segoe UI", 11)).pack(anchor="w")
+        lv = tk.Label(f, text=val, bg=CARD, fg=color, font=("Segoe UI", 18, "bold"))
+        lv.pack(anchor="w")
+        tk.Label(f, text=label, bg=CARD, fg=TEXT3, font=("Segoe UI", 8)).pack(anchor="w")
+        return lv
 
-    def _sort_by(self, col):
-        rev = self._sort_state.get(col, False)
-        items = [(self._tree.set(k, col), k) for k in self._tree.get_children("")]
-        items.sort(reverse=rev)
-        for i, (_, k) in enumerate(items):
-            self._tree.move(k, "", i)
-        self._sort_state[col] = not rev
+    def _mkpill(self, parent, label):
+        colors = {"Tous": (ACCENT, ACCENT_L), "Vert": (GREEN, GREEN_BG),
+                  "Orange": (ORANGE, ORANGE_BG), "Suggestion": (PURPLE, PURPLE_BG),
+                  "Rouge": (RED, RED_BG), "En attente": (TEXT2, CARD2)}
+        fc, bc = colors.get(label, (TEXT2, CARD2))
+        b = tk.Label(parent, text=label, bg=BG, fg=TEXT3,
+                     font=("Segoe UI", 9), padx=10, pady=5, cursor="hand2")
+        b.pack(side="left", padx=3, pady=10)
+        b._fc = fc; b._bc = bc; b._pill = True
 
-    def _show_detail(self, event):
+        def _click(e):
+            self._quick_filter.set(label)
+            for lbl2, w in self._pill_ws.items():
+                active = lbl2 == label
+                w.config(bg=w._bc if active else BG,
+                         fg=w._fc if active else TEXT3)
+            self._refresh_table()
+        b.bind("<Button-1>", _click)
+        if label == "Tous":
+            b.config(bg=bc, fg=fc)
+        self._pill_ws[label] = b
+
+    # ── Colonnes visibles ────────────────────────────────────────────────────
+    def _apply_displaycols(self):
+        visible = [lbl for lbl in ALL_COL_LABELS if self._col_visible.get(lbl, True)]
+        self._tree["displaycolumns"] = visible
+
+    def _open_col_vis(self):
+        if self._open_popup and self._open_popup.winfo_exists():
+            self._open_popup.destroy()
+
+        def _toggle(label, visible):
+            self._col_visible[label] = visible
+            self._apply_displaycols()
+
+        x = self.winfo_rootx() + self.winfo_width() - 280
+        y = self.winfo_rooty() + 90
+        p = ColVisPanel(self, self._col_visible, _toggle)
+        p.geometry(f"240x420+{x}+{y}")
+        self._open_popup = p
+
+    # ── Sélection native + clic sur badge Statut ─────────────────────────────
+    def _on_selection_change(self, event=None):
+        """Met à jour le compteur quand la sélection Treeview change."""
+        n_sel   = len(self._tree.selection())
+        n_total = len(self.df) if self.df is not None else 0
+        self._lbl_sel.config(text=f"{n_sel}/{n_total} sélectionné(s)")
+
+    def _on_click(self, event):
+        """Clic gauche sur la cellule Statut d'une ligne suggestion → ouvre les suggestions.
+        Ignoré si clic droit ou si guard actif."""
+        if event.num != 1:          # ignorer clic droit / molette
+            return
+        region = self._tree.identify_region(event.x, event.y)
+        iid    = self._tree.identify_row(event.y)
+        if region != "cell" or not iid:
+            return
+        try:
+            col_pos = int(self._tree.identify_column(event.x).replace("#", "")) - 1
+        except ValueError:
+            return
+        if col_pos == _STATUT_IDX:
+            rd = self._get_row_dict(int(iid))
+            if rd["_status"] == "suggestion":
+                self._sugg_guard = True
+                self.after(500, self._clear_sugg_guard)
+                self._open_suggestions(int(iid))
+                return "break"
+
+    def _clear_sugg_guard(self):
+        self._sugg_guard = False
+
+    def _set_sugg_guard(self):
+        """Pose le guard manuellement (depuis le menu contextuel)."""
+        self._sugg_guard = True
+        self.after(600, self._clear_sugg_guard)
+
+    def _check_all(self):
+        """Sélectionne toutes les lignes visibles."""
+        children = self._tree.get_children()
+        self._tree.selection_set(*children)
+
+    def _check_none(self):
+        """Désélectionne toutes les lignes."""
+        self._tree.selection_remove(*self._tree.get_children())
+
+    def _search_checked(self):
         sel = self._tree.selection()
         if not sel:
+            messagebox.showinfo("Aucune sélection",
+                                "Sélectionnez au moins une ligne d'abord.")
             return
-        vals = self._tree.item(sel[0], "values")
-        COLS = ("Intitulé","CP","Ville","SIREN","SIRET","Mode",
-                "Adresse trouvée","CP trouvé","Ville trouvée",
-                "SIREN trouvé","SIRET trouvé","Statut")
-        win = tk.Toplevel(self, bg=BG)
-        win.title("Détail de la ligne")
-        win.geometry("540x460")
-        tk.Label(win, text="📋 Détail", bg=BG, fg=ACCENT,
-                 font=("Segoe UI",13,"bold")).pack(pady=(18,8))
-        for col, val in zip(COLS, vals):
-            row = tk.Frame(win, bg=CARD, pady=4)
-            row.pack(fill="x", padx=16, pady=2)
-            tk.Label(row, text=col, bg=CARD, fg=TEXT_DIM,
-                     font=("Segoe UI",9), width=22, anchor="w").pack(side="left", padx=8)
-            tk.Label(row, text=val or "–", bg=CARD, fg=TEXT,
-                     font=("Segoe UI",9,"bold"), anchor="w").pack(side="left", padx=4)
-        tk.Button(win, text="Fermer", command=win.destroy,
-                  bg=ACCENT, fg="white", relief="flat",
-                  font=("Segoe UI",10,"bold"), padx=20, pady=8,
-                  cursor="hand2").pack(pady=16)
+        self._start_search(only_checked=True)
 
+    # ── Tri & filtres colonnes ───────────────────────────────────────────────
+    def _header_click(self, col):
+        self._sort_rev = not self._sort_rev if self._sort_col == col else False
+        self._sort_col = col
+        self._refresh_table()
+        self._sync_heading_icons()
+
+    def _sync_heading_icons(self):
+        for c in ALL_COL_LABELS:
+            dot  = " ●" if c in self._col_filters else ""
+            icon = (("  ↑" if not self._sort_rev else "  ↓") if c == self._sort_col
+                    else "  ▾")
+            self._tree.heading(c, text=f"{c}{dot}{icon}")
+
+    def _open_col_filter(self, col_label, x, y):
+        if self._open_popup and self._open_popup.winfo_exists():
+            self._open_popup.destroy()
+        ckey     = _COL_KEY[col_label]
+        # Filtre les None (lignes pas encore construites dans le cache lazy)
+        all_vals = [rd.get(ckey, "") for rd in self._row_cache if rd is not None]
+
+        def _on_change(lbl, sel_set):
+            if sel_set is None:
+                self._col_filters.pop(lbl, None)
+            else:
+                self._col_filters[lbl] = sel_set
+            self._sync_heading_icons()
+            self._update_filter_indicator()
+            self._refresh_table()
+
+        p = ColFilterPopup(self, col_label, all_vals,
+                           self._col_filters.get(col_label), _on_change)
+        p.geometry(f"260x380+{x}+{y}")
+        self._open_popup = p
+
+    def _update_filter_indicator(self):
+        n = len(self._col_filters)
+        self._lbl_flt.config(text=f"  {n} filtre(s)" if n else "")
+
+    def _clear_all_filters(self):
+        self._search_var.set("")
+        self._col_filters.clear()
+        self._sync_heading_icons()
+        self._update_filter_indicator()
+        self._refresh_table()
+
+    # ── Import ───────────────────────────────────────────────────────────────
     def _import(self):
         path = filedialog.askopenfilename(
             title="Importer un fichier Excel",
-            filetypes=[("Excel","*.xlsx *.xls"),("Tous","*.*")])
+            filetypes=[("Excel", "*.xlsx *.xls"), ("Tous", "*.*")])
         if not path:
             return
         try:
             df = pd.read_excel(path, header=0, dtype=str).fillna("")
             df.columns = [str(c).strip() for c in df.columns]
-
-            ALIASES = {
-                "intitule":          ["intitulé","intitule","nom","raison sociale","libellé"],
-                "adresse":           ["adresse"],
-                "complement":        ["complément","complement"],
-                "code_postal":       ["code postal","code_postal","cp","code postale"],
-                "ville":             ["ville"],
-                "siren":             ["siren"],
-                "siret":             ["siret"],
-                "tva":               ["n° de tva","tva","n°tva"],
-                "siren_ou_siret":    ["siren ou siret ?","siren ou siret","siren_ou_siret","type id"],
-                "adresse_trouvee":   ["adresse trouvée","adresse trouvee","adresse_trouvee"],
-                "complement_trouve": ["complément  trouvée","complement trouvee","complement_trouve","complément trouvée"],
-                "cp_trouve":         ["code postal  trouvée","code postal trouvee","cp_trouve","code postal trouvée"],
-                "ville_trouvee":     ["ville trouvée","ville trouvee","ville_trouvee"],
-                "siren_trouve":      ["siren trouvée","siren trouvee","siren_trouve"],
-                "siret_trouve":      ["siret trouvée","siret trouvee","siret_trouve"],
-            }
-            raw_lower = {c.lower(): c for c in df.columns}
-            col_index = {}
-            for key, alist in ALIASES.items():
+            raw_lower  = {c.lower(): c for c in df.columns}
+            col_index  = {}
+            for key, alist in COL_ALIASES.items():
                 for alias in alist:
                     if alias.lower() in raw_lower:
                         col_index[key] = raw_lower[alias.lower()]
                         break
 
-            self.df        = df
-            self.col_index = col_index
-            self.filepath  = path
-            self.results   = [None] * len(df)
+            self.df             = df
+            self.col_index      = col_index
+            self.results        = [None] * len(df)
+            self._row_cache     = [None] * len(df)      # lazy
+            self._cache_dirty   = set(range(len(df)))   # tout est dirty
+            self._counts     = {"green": 0, "orange": 0, "red": 0, "suggestion": 0, "pending": len(df)}
+            self._done_count = 0
+            self._col_filters.clear()
+            self._sync_heading_icons()
+            self._update_filter_indicator()
+
             n = len(df)
-            self._lbl_file.config(text=f"📄 {os.path.basename(path)}  ({n} ligne{'s' if n>1 else ''})")
-            self._btn_search.config(state="normal")
-            self._btn_export.config(state="disabled")
-            self._lbl_total.config(text=str(n))
-            self._lbl_green.config(text="0")
-            self._lbl_orange.config(text="0")
-            self._lbl_red.config(text="0")
-            self._lbl_pend.config(text=str(n))
-            self._progress["value"]   = 0
+            self._lbl_file.config(
+                text=f"📄 {os.path.basename(path)}  ·  {n} ligne{'s' if n > 1 else ''}")
+            self._btn_search.config_state(True)
+            self._btn_export.config_state(False)
+            self._btn_tva.config_state(False)
+            self._btn_vies.config_state(False)
+            self._sc_total.config(text=str(n))
+            for sc in (self._sc_green, self._sc_orange, self._sc_red):
+                sc.config(text="0")
+            self._sc_sugg.config(text="0")
+            self._sc_pend.config(text=str(n))
+            self._progress["value"] = 0
             self._progress["maximum"] = max(n, 1)
-            self._status.config(text=f"Fichier chargé : {n} ligne(s) prête(s) à enrichir.")
+            self._statusbar.config(text=f"✅  {n} ligne(s) chargée(s).")
             self._refresh_table()
         except Exception as e:
-            messagebox.showerror("Erreur", f"Impossible de lire le fichier :\n{e}")
+            messagebox.showerror("Erreur import", str(e))
 
-    def _gc(self, row, key):
+    def _gc(self, row, key: str) -> str:
+        """Lit une cellule mappée depuis une ligne DataFrame."""
         col = self.col_index.get(key)
-        if col and col in row.index:
-            return str(row[col]).strip()
-        return ""
+        # col_index est fixe après import : pas besoin de vérifier row.index à chaque fois
+        return str(row[col]).strip() if col else ""
 
-    def _row_dict(self, row):
-        return {k: self._gc(row, k) for k in self.col_index}
+    def _build_row_dict(self, idx: int) -> dict:
+        """Construit le dict de rendu pour une ligne (résultat + source)."""
+        row      = self.df.iloc[idx]
+        res      = self.results[idx] or {}
+        enriched = res.get("enriched", {})
+        status   = res.get("status", "pending")
+        return {
+            "intitule":      self._gc(row, "intitule"),
+            "adresse":        self._gc(row, "adresse"),
+            "code_postal":    self._gc(row, "code_postal"),
+            "ville":          self._gc(row, "ville"),
+            "siren":          self._gc(row, "siren"),
+            "siret":          self._gc(row, "siret"),
+            "siren_ou_siret": self._gc(row, "siren_ou_siret"),
+            "adresse_trouvee":enriched.get("adresse_trouvee", ""),
+            "cp_trouve":      enriched.get("cp_trouve", ""),
+            "ville_trouvee":  enriched.get("ville_trouvee", ""),
+            "siren_trouve":   enriched.get("siren_trouve", ""),
+            "siret_trouve":   enriched.get("siret_trouve", ""),
+            "tva_calcule":    enriched.get("tva_calcule", ""),
+            "vies_result":    enriched.get("vies_result", ""),
+            "statut":         _STATUS_LABEL.get(status, "⏳ En attente"),
+            "_status":        status,
+            "_idx":           idx,
+        }
 
+    def _get_row_dict(self, idx: int) -> dict:
+        """Retourne le dict du cache, en reconstruisant si dirty."""
+        if idx in self._cache_dirty or self._row_cache[idx] is None:
+            self._row_cache[idx] = self._build_row_dict(idx)
+            self._cache_dirty.discard(idx)
+        return self._row_cache[idx]
+
+    def _invalidate(self, idx: int):
+        """Marque une ligne comme dirty."""
+        self._cache_dirty.add(idx)
+
+    def _on_search_change(self, *_):
+        """Debounce : attend 200 ms après la dernière frappe avant de rafraîchir."""
+        if self._debounce_id:
+            self.after_cancel(self._debounce_id)
+        self._debounce_id = self.after(200, self._refresh_table)
+
+    # ── Refresh table ─────────────────────────────────────────────────────────
     def _refresh_table(self):
-        flt    = self._filter_var.get()
-        search = normalize(self._search_var.get())
-        self._tree.delete(*self._tree.get_children())
         if self.df is None:
             return
+        self._debounce_id = None
+        flt    = self._quick_filter.get()
+        search = normalize(self._search_var.get())
 
-        counts = {"green":0,"orange":0,"red":0,"pending":0}
+        # Reconstruire uniquement les entrées dirty
+        for i in list(self._cache_dirty):
+            self._row_cache[i] = self._build_row_dict(i)
+        self._cache_dirty.clear()
 
-        for idx, row in self.df.iterrows():
-            res      = (self.results[idx] or {}) if self.results else {}
-            enriched = res.get("enriched", {})
-            status   = res.get("status", "pending")
-            k = status if status in counts else "pending"
-            counts[k] += 1
+        self._tree.delete(*self._tree.get_children())
+        display = []
 
-            if flt == "Vert"       and status != "green":   continue
-            if flt == "Orange"     and status != "orange":  continue
-            if flt == "Rouge"      and status != "red":     continue
-            if flt == "En attente" and status != "pending": continue
+        for rd in self._row_cache:
+            if rd is None:
+                continue
+            st = rd["_status"]
 
-            intitule = self._gc(row,"intitule")
-            cp_o     = self._gc(row,"code_postal")
-            ville_o  = self._gc(row,"ville")
-            siren_o  = self._gc(row,"siren")
-            siret_o  = self._gc(row,"siret")
-            mode_o   = self._gc(row,"siren_ou_siret")
-            adr_t    = enriched.get("adresse_trouvee","")
-            cp_t     = enriched.get("cp_trouve","")
-            ville_t  = enriched.get("ville_trouvee","")
-            siren_t  = enriched.get("siren_trouve","")
-            siret_t  = enriched.get("siret_trouve","")
+            if flt == "Vert"       and st != "green":      continue
+            if flt == "Orange"     and st != "orange":     continue
+            if flt == "Rouge"      and st != "red":        continue
+            if flt == "Suggestion" and st != "suggestion": continue
+            if flt == "En attente" and st != "pending":    continue
 
             if search:
-                blob = normalize(" ".join([intitule,cp_o,ville_o,siren_o,siret_o,adr_t,ville_t]))
+                # Blob uniquement sur les clés affichables (pas _check/_status/_idx)
+                blob = normalize(" ".join(
+                    str(rd.get(k, "")) for k in ALL_COL_KEYS if not k.startswith("_")
+                ))
                 if search not in blob:
                     continue
 
-            s_lbl = {"green":"✅ Vert","orange":"🟠 Orange","red":"❌ Rouge"}.get(status,"⏳ En attente")
-            tag   = status if status in ("green","orange","red") else "pending"
+            if any(allowed is not None
+                   and str(rd.get(_COL_KEY.get(lbl, ""), "")) not in allowed
+                   for lbl, allowed in self._col_filters.items()):
+                continue
 
-            self._tree.insert("","end",iid=str(idx),tags=(tag,),
-                              values=(intitule,cp_o,ville_o,siren_o,siret_o,mode_o,
-                                      adr_t,cp_t,ville_t,siren_t,siret_t,s_lbl))
+            display.append(rd)
 
-        self._lbl_green.config(text=str(counts["green"]))
-        self._lbl_orange.config(text=str(counts["orange"]))
-        self._lbl_red.config(text=str(counts["red"]))
-        self._lbl_pend.config(text=str(counts["pending"]))
+        if self._sort_col and self._sort_col in ALL_COL_LABELS:
+            sk = _COL_KEY[self._sort_col]
+            display.sort(key=lambda r: str(r.get(sk, "")), reverse=self._sort_rev)
 
-    def _start_search(self):
+        for rd in display:
+            st  = rd["_status"]
+            tag = st if st in ("green", "orange", "red", "suggestion") else "pending"
+            self._tree.insert("", "end", iid=str(rd["_idx"]), tags=(tag,),
+                              values=tuple(rd.get(k, "") for k in ALL_COL_KEYS))
+
+        # Stats depuis le compteur incrémental (O(1))
+        self._sc_green.config(text=str(self._counts["green"]))
+        self._sc_orange.config(text=str(self._counts["orange"]))
+        self._sc_red.config(text=str(self._counts["red"]))
+        self._sc_sugg.config(text=str(self._counts.get("suggestion", 0)))
+        self._sc_pend.config(text=str(self._counts.get("pending", 0)))
+        # Le compteur est mis à jour par <<TreeviewSelect>> automatiquement
+
+    # ── Recherche ─────────────────────────────────────────────────────────────
+    def _start_search(self, only_checked: bool = False):
         if self.df is None:
             return
         self._running = True
-        self._btn_search.config(state="disabled")
-        self._btn_stop.config(state="normal")
-        self._btn_import.config(state="disabled")
-        self._btn_export.config(state="disabled")
-        self._progress["value"]   = 0
-        self._progress["maximum"] = max(len(self.df),1)
-        threading.Thread(target=self._worker, daemon=True).start()
+        for b in (self._btn_search, self._btn_import,
+                  self._btn_export, self._btn_tva, self._btn_vies):
+            b.config_state(False)
+        self._btn_stop.config_state(True)
+        if only_checked:
+            to_search = frozenset(int(iid) for iid in self._tree.selection())
+        else:
+            to_search = frozenset(range(len(self.df)))
+        self._done_count = 0
+        self._progress["value"] = 0
+        self._progress["maximum"] = max(len(to_search), 1)
+        threading.Thread(target=self._worker, args=(to_search,), daemon=True).start()
 
     def _stop(self):
         self._running = False
-        self._btn_stop.config(state="disabled")
-        self._status.config(text="Recherche interrompue par l'utilisateur.")
+        self._btn_stop.config_state(False)
+        self._statusbar.config(text="⏹  Recherche interrompue.")
 
-    def _worker(self):
-        for idx, row in self.df.iterrows():
-            if not self._running:
-                break
-            if not self._gc(row,"intitule"):
-                self.q.put(("result",idx,{},""))
-                continue
-            try:
-                enriched, status = enrich_row(self._row_dict(row))
-            except Exception:
-                enriched, status = {}, "red"
-            self.q.put(("result",idx,enriched,status))
-            time.sleep(0.20)
-        self.q.put(("done",None,None,None))
+    def _worker(self, to_search: set):
+        """try/finally garantit que done est toujours envoyé."""
+        try:
+            with requests.Session() as session:
+                session.headers.update(HEADERS)
+                for idx in sorted(to_search):
+                    if not self._running:
+                        break
+                    row      = self.df.iloc[idx]
+                    intitule = self._gc(row, "intitule")
+                    if not intitule:
+                        self.q.put(("result", idx, {}, "", [], None))
+                        continue
+                    row_dict = {k: self._gc(row, k) for k in self.col_index}
+                    try:
+                        enriched, status, suggestions = enrich_row(row_dict, session)
+                    except Exception:
+                        enriched, status, suggestions = {}, "red", []
+                    self.q.put(("result", idx, enriched, status, suggestions, None))
+                    time.sleep(0.20)
+        except Exception:
+            pass
+        finally:
+            self.q.put(("done", None, None, None, None, None))
 
     def _poll_queue(self):
         try:
             while True:
-                kind,idx,enriched,status = self.q.get_nowait()
+                kind, idx, enriched, status, suggestions, _extra = self.q.get_nowait()
                 if kind == "done":
                     self._running = False
-                    self._btn_search.config(state="normal")
-                    self._btn_stop.config(state="disabled")
-                    self._btn_import.config(state="normal")
-                    self._btn_export.config(state="normal")
-                    self._status.config(text="✅ Recherche terminée — Vous pouvez exporter.")
+                    for b in (self._btn_search, self._btn_import,
+                              self._btn_export, self._btn_tva, self._btn_vies):
+                        b.config_state(True)
+                    self._btn_stop.config_state(False)
+                    self._statusbar.config(
+                        text="✅  Terminé — Lancez «Calculer N° TVA» ou exportez.")
                     self._refresh_table()
                     break
+
                 if kind == "result":
-                    self.results[idx] = {"enriched":enriched,"status":status}
-                    done = sum(1 for r in self.results if r is not None)
-                    self._progress["value"] = done
-                    intitule = self._gc(self.df.iloc[idx],"intitule")
-                    pct = done / max(len(self.df),1) * 100
-                    icon = {"green":"✅","orange":"🟠","red":"❌","":"⏭"}.get(status,"⏳")
-                    self._lbl_progress.config(
-                        text=f"{icon}  {done}/{len(self.df)}  |  {intitule[:55]}")
-                    self._status.config(
-                        text=f"Traitement : {pct:.0f}%  ({done}/{len(self.df)}) — {intitule[:65]}")
-                    s_lbl = {"green":"✅ Vert","orange":"🟠 Orange","red":"❌ Rouge","":"⏭ Ignoré"}.get(status,"⏳")
-                    tag   = status if status in ("green","orange","red") else "pending"
+                    # Compteurs incrémentaux O(1)
+                    old_status = (self.results[idx] or {}).get("status", "")
+                    if old_status in self._counts:
+                        self._counts[old_status] -= 1
+                    self.results[idx] = {"enriched": enriched, "status": status,
+                                         "suggestions": suggestions}
+                    if status in self._counts:
+                        self._counts[status] += 1
+
+                    self._done_count += 1
+                    self._invalidate(idx)
+                    self._progress["value"] = self._done_count
+                    name = self._gc(self.df.iloc[idx], "intitule")
+                    pct  = self._done_count / max(self._progress["maximum"], 1) * 100
+                    icon = {"green":"✅","orange":"🟠","red":"❌",
+                            "suggestion":"🔍","":"⏭"}.get(status, "⏳")
+                    self._lbl_prog.config(text=f"{icon}  {self._done_count}   {name[:55]}")
+                    self._statusbar.config(
+                        text=f"Enrichissement : {pct:.0f}%  ({self._done_count}) — {name[:65]}")
+
+                    # Mise à jour ciblée de la ligne dans le Treeview
+                    rd  = self._get_row_dict(idx)
+                    tag = status if status in ("green","orange","red","suggestion") else "pending"
                     try:
-                        r = self.df.iloc[idx]
-                        self._tree.item(str(idx),tags=(tag,),
-                            values=(self._gc(r,"intitule"),self._gc(r,"code_postal"),
-                                    self._gc(r,"ville"),self._gc(r,"siren"),
-                                    self._gc(r,"siret"),self._gc(r,"siren_ou_siret"),
-                                    enriched.get("adresse_trouvee",""),
-                                    enriched.get("cp_trouve",""),
-                                    enriched.get("ville_trouvee",""),
-                                    enriched.get("siren_trouve",""),
-                                    enriched.get("siret_trouve",""),
-                                    s_lbl))
+                        if self._tree.exists(str(idx)):
+                            self._tree.item(str(idx), tags=(tag,),
+                                values=tuple(rd.get(k, "") for k in ALL_COL_KEYS))
                     except Exception:
                         pass
-                    cnts = {"green":0,"orange":0,"red":0}
-                    for r2 in self.results:
-                        if r2 and r2.get("status") in cnts:
-                            cnts[r2["status"]] += 1
-                    self._lbl_green.config(text=str(cnts["green"]))
-                    self._lbl_orange.config(text=str(cnts["orange"]))
-                    self._lbl_red.config(text=str(cnts["red"]))
-                    self._lbl_pend.config(text=str(sum(1 for r2 in self.results if r2 is None)))
+
+                    self._sc_green.config(text=str(self._counts["green"]))
+                    self._sc_orange.config(text=str(self._counts["orange"]))
+                    self._sc_red.config(text=str(self._counts["red"]))
+                    self._sc_sugg.config(text=str(self._counts.get("suggestion", 0)))
+                    self._sc_pend.config(text=str(self._counts.get("pending", 0)))
+                if kind == "vies":
+                    # ("vies", df_idx, done_count, total, tva, vies_result)
+                    done   = enriched   # done_count
+                    total  = status     # total
+                    tva    = suggestions  # tva string
+                    result = _extra     # vies result string
+                    self._progress["value"] = done
+                    icon = "✅" if "Valide" in str(result) else ("❌" if result else "⚠")
+                    self._statusbar.config(
+                        text=f"VIES : {done}/{total}  {icon} {tva}  → {result}")
+                    # Mise à jour directe de la ligne dans le Treeview
+                    self._invalidate(idx)
+                    rd  = self._get_row_dict(idx)
+                    tag = rd.get("_status","pending")
+                    tag = tag if tag in ("green","orange","red","suggestion") else "pending"
+                    try:
+                        if self._tree.exists(str(idx)):
+                            self._tree.item(str(idx), tags=(tag,),
+                                values=tuple(rd.get(k,"") for k in ALL_COL_KEYS))
+                    except Exception:
+                        pass
+
+                if kind == "vies_done":
+                    self._running = False
+                    for b in (self._btn_vies, self._btn_tva, self._btn_search,
+                              self._btn_import, self._btn_export):
+                        b.config_state(True)
+                    self._btn_stop.config_state(False)
+                    self._col_visible["Ctrl VIES"] = True
+                    self._apply_displaycols()
+                    self._refresh_table()
+                    n_valid   = sum(1 for r in self.results
+                                   if r and "Valide" in r.get("enriched",{}).get("vies_result",""))
+                    n_invalid = sum(1 for r in self.results
+                                   if r and "Invalide" in r.get("enriched",{}).get("vies_result",""))
+                    n_err     = sum(1 for r in self.results
+                                   if r and "⚠" in r.get("enriched",{}).get("vies_result",""))
+                    self._statusbar.config(
+                        text=f"✅ VIES terminé — {n_valid} valide(s)  {n_invalid} invalide(s)  {n_err} erreur(s)")
+                    messagebox.showinfo(
+                        "Vérification VIES ✅",
+                        f"Contrôle terminé :\n\n"
+                        f"  ✅ Valides   : {n_valid}\n"
+                        f"  ❌ Invalides : {n_invalid}\n"
+                        f"  ⚠  Erreurs  : {n_err}\n\n"
+                        "La colonne «Ctrl VIES» est maintenant visible.")
+                    # Pas de break : vider la queue entièrement
+
         except queue.Empty:
             pass
         self.after(80, self._poll_queue)
 
-    def _export(self):
+    # ── Calcul TVA ────────────────────────────────────────────────────────────
+    def _compute_tva_all(self):
         if self.df is None:
             return
+        n = 0
+        for idx, res in enumerate(self.results):
+            if not res:
+                continue
+            siren = res.get("enriched", {}).get("siren_trouve", "")
+            tva   = compute_tva(siren)
+            if tva:
+                res["enriched"]["tva_calcule"] = tva
+                self._invalidate(idx)
+                n += 1
+        self._col_visible["N° TVA"] = True
+        self._apply_displaycols()
+        self._refresh_table()
+        self._btn_vies.config_state(True)
+        self._statusbar.config(text=f"✅  {n} N° TVA calculés. Lancez «Vérification VIES» pour contrôle.")
+        messagebox.showinfo("TVA calculée ✅",
+            f"{n} numéro(s) TVA calculés.\n\n"
+            "Formule : FR + clé 2 chiffres + SIREN\n"
+            "Clé = (12 + 3×(SIREN mod 97)) mod 97\n\n"
+            "La colonne «N° TVA» a été affichée automatiquement.")
+
+    # ── Vérification VIES ────────────────────────────────────────────────────
+    def _verify_vies_all(self):
+        """Lance la vérification VIES sur toutes les lignes ayant un N° TVA calculé.
+        Tourne dans un thread pour ne pas bloquer l'UI."""
+        if self.df is None:
+            return
+
+        # Compte les TVA disponibles
+        to_check = [
+            idx for idx, res in enumerate(self.results)
+            if res and res.get("enriched", {}).get("tva_calcule", "")
+        ]
+        if not to_check:
+            messagebox.showinfo(
+                "Aucun N° TVA",
+                "Aucun numéro TVA disponible.\n"
+                "Lancez d'abord «Calculer N° TVA».")
+            return
+
+        # Désactive les boutons pendant la vérification
+        for b in (self._btn_vies, self._btn_tva, self._btn_search,
+                  self._btn_import, self._btn_export):
+            b.config_state(False)
+        self._btn_stop.config_state(True)
+        self._progress["value"] = 0
+        self._progress["maximum"] = len(to_check)
+        self._statusbar.config(
+            text=f"Vérification VIES : 0/{len(to_check)} en cours…")
+
+        self._running = True   # permet à Arrêter de couper le worker VIES
+        threading.Thread(
+            target=self._vies_worker,
+            args=(to_check,),
+            daemon=True
+        ).start()
+
+    def _vies_worker(self, to_check: list):
+        """Thread de vérification VIES.
+        try/finally garantit que vies_done est toujours envoyé (UI jamais bloquée)."""
+        try:
+            with requests.Session() as session:
+                session.headers.update(_VIES_HDR)
+                for done, idx in enumerate(to_check, 1):
+                    if not self._running:
+                        break
+                    res      = self.results[idx] or {}
+                    enriched = res.get("enriched", {})
+                    tva      = enriched.get("tva_calcule", "")
+                    result   = vies_check(tva, session) if tva else ""
+                    enriched["vies_result"] = result
+                    self._invalidate(idx)
+                    self.q.put(("vies", idx, done, len(to_check), tva, result))
+                    time.sleep(0.5)
+        except Exception:
+            pass
+        finally:
+            self.q.put(("vies_done", None, None, None, None, None))
+
+    # ── Double-clic ───────────────────────────────────────────────────────────
+    def _on_dbl_click(self, event):
+        """Double-clic gauche → détail de la ligne.
+        Ignoré si le guard suggestion est actif (un clic vient d'ouvrir la suggestion)."""
+        if self._sugg_guard or event.num != 1:
+            return
+        region = self._tree.identify_region(event.x, event.y)
+        iid    = self._tree.identify_row(event.y)
+        if region not in ("cell", "tree") or not iid:
+            return
+        self._show_detail(int(iid))
+
+    def _open_suggestions(self, idx: int):
+        """Ouvre une unique SuggestionWindow modale pour la ligne idx."""
+        # Ferme toute fenêtre précédente
+        if self._suggestion_win is not None:
+            try:
+                if self._suggestion_win.winfo_exists():
+                    self._suggestion_win.grab_release()
+                    self._suggestion_win.destroy()
+            except Exception:
+                pass
+            self._suggestion_win = None
+
+        res        = self.results[idx] or {}
+        candidates = res.get("suggestions", [])
+        rd         = self._get_row_dict(idx)
+
+        if not candidates:
+            messagebox.showinfo("Pas de suggestions",
+                                "Aucune suggestion disponible.\n"
+                                "Relancez la recherche pour cette ligne.")
+            return
+
+        def _on_pick(candidate):
+            mode    = self._gc(self.df.iloc[idx], "siren_ou_siret").lower()
+            cp_orig = self._gc(self.df.iloc[idx], "code_postal")
+            try:
+                enriched = apply_suggestion(candidate, cp_orig, mode)
+            except Exception as e:
+                messagebox.showerror("Erreur", f"Impossible d'appliquer la suggestion :\n{e}")
+                return
+            # Mise à jour des compteurs : décrémente l'ancien statut, incrémente orange
+            old_st = (self.results[idx] or {}).get("status", "")
+            if old_st in self._counts:
+                self._counts[old_st] -= 1
+            self._counts["orange"] = self._counts.get("orange", 0) + 1
+            self.results[idx] = {"enriched": enriched,
+                                  "status": "orange", "suggestions": []}
+            self._invalidate(idx)
+            self._refresh_table()
+            self._statusbar.config(
+                text=f"✅  Suggestion appliquée pour «{rd.get('intitule', '')}»")
+
+        self._suggestion_win = SuggestionWindow(
+            self,
+            rd.get("intitule", ""),
+            rd.get("code_postal", ""),
+            rd.get("ville", ""),
+            candidates,
+            _on_pick,
+        )
+
+    def _show_detail(self, idx: int):
+        """Ouvre une fenêtre de détail (non modale) pour la ligne idx."""
+        rd   = self._get_row_dict(idx)
+        st   = rd.get("_status", "pending")
+        hcol = {"green": GREEN, "orange": ORANGE,
+                "red": RED, "suggestion": PURPLE}.get(st, ACCENT)
+        hbg  = {"green": GREEN_BG, "orange": ORANGE_BG,
+                "red": RED_BG, "suggestion": PURPLE_BG}.get(st, ACCENT_L)
+
+        win = tk.Toplevel(self, bg=BG)
+        win.title(f"Détail — {rd.get('intitule', '—')[:50]}")
+        win.geometry("580x580")
+        win.resizable(True, True)
+        win.transient(self)   # reste au-dessus sans bloquer
+
+        tk.Frame(win, bg=hcol, height=4).pack(fill="x")
+        hdr = tk.Frame(win, bg=CARD)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=rd.get("intitule", "—"), bg=CARD, fg=TEXT,
+                 font=("Segoe UI", 13, "bold"), pady=12, padx=18).pack(side="left")
+        tk.Label(hdr, text=rd.get("statut", ""), bg=hbg, fg=hcol,
+                 font=("Segoe UI", 9, "bold"), padx=10, pady=4).pack(
+                     side="right", padx=18, pady=12)
+
+        # Corps scrollable
+        scroll_frame = tk.Frame(win, bg=BG)
+        scroll_frame.pack(fill="both", expand=True)
+        canvas = tk.Canvas(scroll_frame, bg=BG, highlightthickness=0)
+        vsb    = ttk.Scrollbar(scroll_frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(canvas, bg=BG)
+        body_win = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(body_win, width=e.width))
+
+        def _field_row(parent, label, val, copyable=True):
+            f = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+            f.pack(fill="x", padx=18, pady=2)
+            tk.Label(f, text=label, bg=CARD, fg=TEXT2,
+                     font=("Segoe UI", 9), width=22, anchor="w",
+                     padx=10, pady=7).pack(side="left")
+            display = val or "–"
+            lbl = tk.Label(f, text=display, bg=CARD, fg=TEXT if val else TEXT3,
+                           font=("Segoe UI", 9, "bold" if val else "normal"),
+                           anchor="w", padx=8, cursor="hand2" if copyable and val else "")
+            lbl.pack(side="left", fill="x", expand=True)
+            if copyable and val:
+                lbl.bind("<Button-1>", lambda e, v=val: self._copy(v))
+                lbl.bind("<Enter>", lambda e: lbl.config(bg=ACCENT_L))
+                lbl.bind("<Leave>", lambda e: lbl.config(bg=CARD))
+
+        for sec_title, fields in [
+            ("DONNÉES SOURCE", [
+                ("Adresse",  rd.get("adresse", "")),
+                ("CP",       rd.get("code_postal", "")),
+                ("Ville",    rd.get("ville", "")),
+                ("SIREN",    rd.get("siren", "")),
+                ("SIRET",    rd.get("siret", "")),
+                ("Type ID",  rd.get("siren_ou_siret", "")),
+            ]),
+            ("DONNÉES TROUVÉES", [
+                ("Adresse trouvée",  rd.get("adresse_trouvee", "")),
+                ("CP trouvé",        rd.get("cp_trouve", "")),
+                ("Ville trouvée",    rd.get("ville_trouvee", "")),
+                ("SIREN trouvé",     rd.get("siren_trouve", "")),
+                ("SIRET trouvé",     rd.get("siret_trouve", "")),
+                ("N° TVA",           rd.get("tva_calcule", "")),
+                ("Ctrl VIES",        rd.get("vies_result", "")),
+            ]),
+        ]:
+            tk.Label(body, text=sec_title, bg=BG, fg=TEXT3,
+                     font=("Segoe UI", 8, "bold")).pack(anchor="w",
+                     padx=18, pady=(12, 4))
+            for lbl_txt, val in fields:
+                _field_row(body, lbl_txt, val)
+
+        hint = tk.Label(body, text="Cliquez sur une valeur pour la copier",
+                        bg=BG, fg=TEXT3, font=("Segoe UI", 8), pady=6)
+        hint.pack(anchor="w", padx=18)
+
+        bf = tk.Frame(win, bg=CARD2)
+        bf.pack(fill="x", side="bottom")
+        if rd.get("_status") == "suggestion":
+            def _open_sugg_from_detail(_idx=idx, _win=win):
+                _win.destroy()
+                self._open_suggestions(_idx)
+            tk.Button(bf, text="🔍  Voir suggestions", cursor="hand2",
+                      command=_open_sugg_from_detail,
+                      bg=PURPLE_BG, fg=PURPLE, relief="flat",
+                      font=("Segoe UI", 9, "bold"), padx=14, pady=8,
+                      ).pack(side="left", padx=8, pady=6)
+        tk.Button(bf, text="Fermer", command=win.destroy,
+                  bg=ACCENT, fg="white", relief="flat",
+                  font=("Segoe UI", 10, "bold"), padx=24, pady=8,
+                  cursor="hand2", activebackground=ACCENT_H).pack(side="right", padx=8, pady=6)
+
+    def _copy(self, text: str):
+        self.clipboard_clear()
+        self.clipboard_append(str(text))
+
+    # ── Menu contextuel ───────────────────────────────────────────────────────
+    def _ctx_menu(self, event):
+        region = self._tree.identify_region(event.x, event.y)
+        if region == "heading":
+            cidx = int(self._tree.identify_column(event.x).replace("#", "")) - 1
+            if 0 <= cidx < len(ALL_COL_LABELS):
+                self._open_col_filter(ALL_COL_LABELS[cidx], event.x_root, event.y_root)
+            return
+
+        if region != "cell":
+            return
+        iid    = self._tree.identify_row(event.y)
+        col_id = self._tree.identify_column(event.x)
+        if not (iid and col_id):
+            return
+        cidx    = int(col_id.replace("#", "")) - 1
+        val     = self._tree.item(iid, "values")[cidx]
+        col_lbl = ALL_COL_LABELS[cidx]
+        idx     = int(iid)
+
+        menu = tk.Menu(self, tearoff=0, bg=CARD, fg=TEXT,
+                       activebackground=ACCENT_L, activeforeground=ACCENT,
+                       font=("Segoe UI", 9))
+        menu.add_command(label=f"Copier  «{str(val)[:40]}»",
+                         command=lambda: self._copy(val))
+        menu.add_separator()
+        menu.add_command(label=f"Filtrer sur «{col_lbl}»",
+                         command=lambda: self._open_col_filter(
+                             col_lbl, event.x_root, event.y_root))
+        if (self.results[idx] or {}).get("status") == "suggestion":
+            menu.add_separator()
+            def _do_open_sugg(i=idx):
+                self._set_sugg_guard()
+                self._open_suggestions(i)
+            menu.add_command(label="🔍  Voir les suggestions",
+                             command=_do_open_sugg)
+        menu.add_separator()
+        menu.add_command(label="Détail complet",
+                         command=lambda i=idx: self._show_detail(i))
+        menu.post(event.x_root, event.y_root)
+
+    # ── Export gabarit ────────────────────────────────────────────────────────
+    def _export_template(self):
         out = filedialog.asksaveasfilename(
-            title="Enregistrer le fichier enrichi",
-            defaultextension=".xlsx",
-            filetypes=[("Excel","*.xlsx")])
+            title="Gabarit Excel", defaultextension=".xlsx",
+            initialfile="gabarit_tiers.xlsx", filetypes=[("Excel", "*.xlsx")])
         if not out:
             return
         try:
-            df_out = self.df.copy()
-            for idx, res in enumerate(self.results):
-                if not res or not res.get("enriched"):
-                    continue
-                e = res["enriched"]
-                def _s(key, val, _i=idx):
-                    col = self.col_index.get(key)
-                    if col and col in df_out.columns:
-                        df_out.at[_i, col] = val
-                _s("adresse_trouvee",   e.get("adresse_trouvee",""))
-                _s("complement_trouve", e.get("complement_trouve",""))
-                _s("cp_trouve",         e.get("cp_trouve",""))
-                _s("ville_trouvee",     e.get("ville_trouvee",""))
-                _s("siren_trouve",      e.get("siren_trouve",""))
-                _s("siret_trouve",      e.get("siret_trouve",""))
-
-            df_out.to_excel(out, index=False)
-
-            wb = load_workbook(out)
-            ws = wb.active
-
-            fills = {
-                "green":  PatternFill("solid", fgColor=FILL_GREEN),
-                "orange": PatternFill("solid", fgColor=FILL_ORANGE),
-                "red":    PatternFill("solid", fgColor=FILL_RED),
-            }
-            hdr_fill = PatternFill("solid", fgColor="1E2140")
-            hdr_font = Font(bold=True, color="FFFFFF", name="Calibri", size=10)
-            thin     = Side(style="thin", color="DDDDDD")
-            brd      = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-            for cell in ws[1]:
-                cell.fill      = hdr_fill
-                cell.font      = hdr_font
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                cell.border    = brd
-            ws.row_dimensions[1].height = 32
-
-            for col_idx, col in enumerate(ws.columns, 1):
-                max_w = max((len(str(c.value or "")) for c in col), default=8)
-                ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_w+2,10),50)
-
-            for row_idx, res in enumerate(self.results, start=2):
-                fill = fills.get((res or {}).get("status",""))
-                for cell in ws[row_idx]:
-                    if fill:
-                        cell.fill = fill
-                    cell.border    = brd
+            wb = Workbook(); ws = wb.active; ws.title = "Gabarit"
+            ws.append(EXPORT_HDR)
+            brd = _xl_style_header(ws, len(EXPORT_SRC))
+            ex_fill = PatternFill("solid", fgColor="F8F9FD")
+            ns = len(EXPORT_SRC)
+            for row_data in [
+                ["TOTAL ENERGIES SE","2 PLACE JEAN MILLIER","","92400","COURBEVOIE",
+                 "542051180","","FR72542051180","siren","","","","","","","",""],
+                ["CARREFOUR SA","","","91300","MASSY","","","","siret","","","","","","","",""],
+                ["LA POSTE","9 RUE DU COLONEL PIERRE AVIA","","75015","PARIS",
+                 "356000000","","","siren","","","","","","","",""],
+            ]:
+                ws.append(row_data)
+                for ci, cell in enumerate(ws[ws.max_row], 1):
+                    cell.fill   = ex_fill
+                    cell.border = brd
+                    cell.font   = Font(name="Calibri", size=10,
+                                       color="4F6EF7" if ci > ns else "1C1E2E",
+                                       italic=(ci > ns))
                     cell.alignment = Alignment(vertical="center")
 
+            for i, w in enumerate([22,22,14,11,16,12,14,16,14,22,14,14,14,14,14,14,14], 1):
+                ws.column_dimensions[get_column_letter(i)].width = w
+
+            ws2 = wb.create_sheet("Notice")
+            ws2["A1"] = "NOTICE"
+            ws2["A1"].font = Font(bold=True, size=13, color="4F6EF7")
+            for r, (ch, desc) in enumerate([
+                ("Intitulé",         "Obligatoire – raison sociale"),
+                ("adresse",          "Facultatif"),
+                ("code postal",      "Recommandé – améliore la précision géographique"),
+                ("ville",            "Recommandé"),
+                ("Siren",            "Facultatif – 9 chiffres (prioritaire)"),
+                ("Siret",            "Facultatif – 14 chiffres (prioritaire)"),
+                ("Siren ou siret ?", "siren / siret / (vide)"),
+                ("Colonnes trouvée", "⚠ Remplies automatiquement"),
+                ("N° TVA calculé",   "Via bouton «Calculer N° TVA»"),
+            ], start=3):
+                ws2.cell(r, 1, ch).font  = Font(bold=True, name="Calibri", size=10)
+                ws2.cell(r, 2, desc).font = Font(name="Calibri", size=10)
+                ws2.cell(r, 1).fill = PatternFill("solid", fgColor="F0F2F8")
+            ws2.column_dimensions["A"].width = 22
+            ws2.column_dimensions["B"].width = 55
+            ws.freeze_panes = "A2"
+            wb.save(out)
+            messagebox.showinfo("Gabarit ✅", f"Créé :\n{out}")
+        except Exception as e:
+            messagebox.showerror("Erreur gabarit", str(e))
+
+    # ── Export résultats ──────────────────────────────────────────────────────
+    def _export(self):
+        if self.df is None:
+            return
+
+        # ── Guard : obligation d'avoir des lignes sélectionnées ──────────────
+        to_export = sorted(int(iid) for iid in self._tree.selection())
+        if not to_export:
+            messagebox.showwarning(
+                "Aucune sélection",
+                "Sélectionnez au moins une ligne avant d'exporter.\n\n"
+                "Utilisez «Tout sélectionner» ou cliquez sur les lignes\n"
+                "souhaitées (Shift+clic pour une plage, Ctrl+clic pour ajouter).")
+            return
+
+        out = filedialog.asksaveasfilename(
+            title=f"Exporter {len(to_export)} ligne(s) cochée(s)",
+            defaultextension=".xlsx",
+            initialfile="tiers_enrichis.xlsx",
+            filetypes=[("Excel", "*.xlsx")])
+        if not out:
+            return
+        try:
+            wb = Workbook(); ws = wb.active; ws.title = "Résultats"
+            ws.append(EXPORT_HDR)
+            brd = _xl_style_header(ws, len(EXPORT_SRC))
+
+            for df_idx in to_export:
+                if df_idx >= len(self.df):
+                    continue
+                df_row   = self.df.iloc[df_idx]
+                res      = self.results[df_idx] or {}
+                enriched = res.get("enriched", {})
+                status   = res.get("status", "")
+                ws.append([self._gc(df_row, k) for k in EXPORT_SRC] +
+                          [enriched.get(k, "") for k in EXPORT_FIND])
+                _xl_style_data_row(ws, ws.max_row, brd, _XL_FILLS.get(status))
+
+            _xl_auto_width(ws)
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
             wb.save(out)
-            messagebox.showinfo("Export réussi ✅", f"Fichier enregistré :\n{out}")
-            self._status.config(text=f"✅ Export OK → {out}")
+
+            n_enriched = sum(
+                1 for i in to_export
+                if self.results[i] and self.results[i].get("status") in
+                ("green", "orange", "suggestion")
+            )
+            messagebox.showinfo(
+                "Export ✅",
+                f"Fichier enregistré :\n{out}\n\n"
+                f"{len(to_export)} ligne(s) exportée(s)\n"
+                f"{n_enriched} enrichie(s) sur {len(to_export)}")
+            self._statusbar.config(text=f"✅  Export OK → {out}")
         except Exception as e:
             messagebox.showerror("Erreur export", str(e))
 
