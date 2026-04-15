@@ -308,6 +308,7 @@ def _make_enriched(result: dict, etab: dict, mode: str) -> dict:
         "ville_trouvee":     (etab.get("libelle_commune") or etab.get("commune") or "").upper(),
         "siren_trouve":      out_siren,
         "siret_trouve":      out_siret,
+        "siren_brut":        siren_t,   # toujours disponible, indépendant du mode
         "tva_calcule":       "",
         "vies_result":       "",
     }
@@ -1338,6 +1339,7 @@ class App(tk.Tk):
             "ville_trouvee":  enriched.get("ville_trouvee", ""),
             "siren_trouve":   enriched.get("siren_trouve", ""),
             "siret_trouve":   enriched.get("siret_trouve", ""),
+            "siren_brut":     enriched.get("siren_brut", ""),
             "tva_calcule":    enriched.get("tva_calcule", ""),
             "vies_result":    enriched.get("vies_result", ""),
             "statut":         _STATUS_LABEL.get(status, "⏳ En attente"),
@@ -1487,7 +1489,10 @@ class App(tk.Tk):
 
                 if kind == "result":
                     # Compteurs incrémentaux O(1)
-                    old_status = (self.results[idx] or {}).get("status", "")
+                    # Une ligne non encore traitée a statut "" → elle est "pending"
+                    old_status = (self.results[idx] or {}).get("status", "pending")
+                    if old_status == "" :
+                        old_status = "pending"
                     if old_status in self._counts:
                         self._counts[old_status] -= 1
                     self.results[idx] = {"enriched": enriched, "status": status,
@@ -1581,10 +1586,17 @@ class App(tk.Tk):
         for idx, res in enumerate(self.results):
             if not res:
                 continue
-            siren = res.get("enriched", {}).get("siren_trouve", "")
-            tva   = compute_tva(siren)
+            enriched = res.get("enriched", {})
+            # Ordre de priorité : siren_brut (toujours disponible) > siren_trouve >
+            # dérivé du siret_trouve (cas mode="siret" sans siren_brut)
+            siren = (enriched.get("siren_brut", "")
+                     or enriched.get("siren_trouve", ""))
+            if not siren:
+                siret = _RE_DIGITS_ONLY.sub("", enriched.get("siret_trouve", ""))
+                siren = siret[:9] if len(siret) >= 9 else ""
+            tva = compute_tva(siren)
             if tva:
-                res["enriched"]["tva_calcule"] = tva
+                enriched["tva_calcule"] = tva
                 self._invalidate(idx)
                 n += 1
         self._col_visible["N° TVA"] = True
@@ -1600,34 +1612,82 @@ class App(tk.Tk):
 
     # ── Vérification VIES ────────────────────────────────────────────────────
     def _verify_vies_all(self):
-        """Lance la vérification VIES sur toutes les lignes ayant un N° TVA calculé.
-        Tourne dans un thread pour ne pas bloquer l'UI."""
+        """Vérification VIES sur les lignes SÉLECTIONNÉES dans le tableau.
+        Calcule la TVA à la volée si elle manque (siren_brut disponible).
+        Tourne dans un thread — UI jamais bloquée."""
         if self.df is None:
             return
 
-        # Compte les TVA disponibles
-        to_check = [
-            idx for idx, res in enumerate(self.results)
-            if res and res.get("enriched", {}).get("tva_calcule", "")
-        ]
-        if not to_check:
-            messagebox.showinfo(
-                "Aucun N° TVA",
-                "Aucun numéro TVA disponible.\n"
-                "Lancez d'abord «Calculer N° TVA».")
+        # ── 1. Lignes sélectionnées dans le Treeview ──────────────────────
+        sel_iids = self._tree.selection()
+        if not sel_iids:
+            messagebox.showwarning(
+                "Aucune sélection",
+                "Sélectionnez au moins une ligne avant de lancer la vérification VIES.\n\n"
+                "Utilisez «Tout sélectionner» ou cliquez sur les lignes souhaitées.")
             return
 
-        # Désactive les boutons pendant la vérification
+        selected_idx = [int(iid) for iid in sel_iids]
+
+        # ── 2. Pour chaque ligne sélectionnée, s'assurer qu'un N° TVA existe ──
+        # Si tva_calcule est vide mais siren_brut/siren_trouve présent → calculer maintenant
+        prepared = 0
+        for idx in selected_idx:
+            res = self.results[idx] if idx < len(self.results) else None
+            if not res:
+                continue
+            enriched = res.get("enriched", {})
+            if not enriched.get("tva_calcule", ""):
+                # Calcul à la volée
+                siren = (enriched.get("siren_brut", "")
+                         or enriched.get("siren_trouve", ""))
+                if not siren:
+                    siret = _RE_DIGITS_ONLY.sub("", enriched.get("siret_trouve", ""))
+                    siren = siret[:9] if len(siret) >= 9 else ""
+                tva = compute_tva(siren)
+                if tva:
+                    enriched["tva_calcule"] = tva
+                    self._invalidate(idx)
+                    prepared += 1
+
+        if prepared:
+            # Rafraîchir pour afficher les TVA nouvellement calculées
+            self._col_visible["N° TVA"] = True
+            self._apply_displaycols()
+            self._refresh_table()
+
+        # ── 3. Construire la liste finale à vérifier ──────────────────────
+        to_check = [
+            idx for idx in selected_idx
+            if (self.results[idx] if idx < len(self.results) else None)
+            and (self.results[idx] or {}).get("enriched", {}).get("tva_calcule", "")
+        ]
+
+        if not to_check:
+            # Aucune TVA calculable parmi la sélection
+            n_sel = len(selected_idx)
+            messagebox.showinfo(
+                "Aucun N° TVA",
+                f"Aucun numéro TVA calculable parmi les {n_sel} ligne(s) sélectionnée(s).\n\n"
+                "Vérifiez que :\n"
+                "  • Les lignes ont bien été enrichies (SIREN trouvé)\n"
+                "  • Le statut n'est pas ❌ Rouge (aucun résultat)")
+            return
+
+        # ── 4. Lancement ──────────────────────────────────────────────────
+        msg = f"Vérification VIES de {len(to_check)}/{len(selected_idx)} ligne(s) sélectionnée(s)"
+        if prepared:
+            msg += f" ({prepared} TVA calculée(s) à la volée)"
+
         for b in (self._btn_vies, self._btn_tva, self._btn_search,
                   self._btn_import, self._btn_export):
             b.config_state(False)
         self._btn_stop.config_state(True)
         self._progress["value"] = 0
         self._progress["maximum"] = len(to_check)
-        self._statusbar.config(
-            text=f"Vérification VIES : 0/{len(to_check)} en cours…")
+        self._statusbar.config(text=f"{msg}…")
 
-        self._running = True   # permet à Arrêter de couper le worker VIES
+        self._running = True
         threading.Thread(
             target=self._vies_worker,
             args=(to_check,),
@@ -1707,6 +1767,11 @@ class App(tk.Tk):
                                   "status": "orange", "suggestions": []}
             self._invalidate(idx)
             self._refresh_table()
+            # Activer TVA/VIES si ce n'est pas déjà le cas
+            # (au cas où la suggestion est appliquée avant que la recherche
+            #  n'ait activé ces boutons, ex. relance partielle)
+            if enriched.get("siren_trouve") or enriched.get("siret_trouve"):
+                self._btn_tva.config_state(True)
             self._statusbar.config(
                 text=f"✅  Suggestion appliquée pour «{rd.get('intitule', '')}»")
 
@@ -1786,7 +1851,7 @@ class App(tk.Tk):
                 ("Adresse trouvée",  rd.get("adresse_trouvee", "")),
                 ("CP trouvé",        rd.get("cp_trouve", "")),
                 ("Ville trouvée",    rd.get("ville_trouvee", "")),
-                ("SIREN trouvé",     rd.get("siren_trouve", "")),
+                ("SIREN trouvé",     rd.get("siren_trouve", "") or rd.get("siren_brut", "")),
                 ("SIRET trouvé",     rd.get("siret_trouve", "")),
                 ("N° TVA",           rd.get("tva_calcule", "")),
                 ("Ctrl VIES",        rd.get("vies_result", "")),
