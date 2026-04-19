@@ -36,7 +36,6 @@ _STOP = frozenset({"","SAS","SA","SARL","SCI","EURL","SNC","SE","SASU",
                    "ET","DE","LA","LE","LES","DU"})
 
 # ── Colonnes  (label, clé_interne, largeur, visible_par_défaut) ───────────────
-# La sélection utilise la sélection native du Treeview (clic/Shift/Ctrl)
 COLS_DEF = [
     ("Intitulé",       "intitule",         175, True),
     ("Adresse orig.",  "adresse",          160, True),
@@ -59,7 +58,7 @@ ALL_COL_KEYS    = [c[1] for c in COLS_DEF]
 ALL_COL_WIDTHS  = [c[2] for c in COLS_DEF]
 DEFAULT_VISIBLE = {c[0]: c[3] for c in COLS_DEF}
 _COL_KEY        = {lbl: key for lbl, key, *_ in COLS_DEF}
-_STATUT_IDX     = ALL_COL_LABELS.index("Statut")  # position col Statut
+_STATUT_IDX     = ALL_COL_LABELS.index("Statut")
 
 COL_ALIASES = {
     "intitule":          ["intitulé","intitule","nom","raison sociale","libellé"],
@@ -144,35 +143,26 @@ def compute_tva(siren_str: str) -> str:
     return f"FR{key:02d}{s}"
 
 
-# ── Vérification VIES (TVA UE) ───────────────────────────────────────────────
-# API REST VIES — deux endpoints pour assurer la compatibilité :
-#   v2 (POST, post-2023) : /rest-api/check-vat-number  { countryCode, vatNumber }
-#   v1 (GET,  pré-2023)  : /rest-api/ms/{cc}/vat/{vat}  (fallback)
+# ── Vérification VIES ────────────────────────────────────────────────────────
 _VIES_V2  = "https://ec.europa.eu/taxation_customs/vies/rest-api/check-vat-number"
 _VIES_V1  = "https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{ms}/vat/{vat}"
 _VIES_HDR = {"Accept": "application/json", "Content-Type": "application/json",
              "User-Agent": "AideRFE/1.0"}
 _VIES_TIMEOUT = 12
-_VIES_RETRY_DELAY = 2.0   # secondes avant 1 retry
+_VIES_RETRY_DELAY = 2.0
 
 
 def vies_check(tva_str: str, session: requests.Session = None) -> str:
-    """
-    Vérifie un N° TVA intracommunautaire via l'API REST VIES de l'UE.
-    Essaie d'abord l'API v2 (POST), puis fallback v1 (GET).
-    Retourne : "✅ Valide", "❌ Invalide", "⚠ Timeout" ou "⚠ Erreur"
-    """
     tva = str(tva_str or "").strip().upper().replace(" ", "")
     if len(tva) < 4 or not tva[:2].isalpha():
         return ""
-    ms  = tva[:2]   # code pays (ex : FR)
-    vat = tva[2:]   # numéro sans le code pays
+    ms  = tva[:2]
+    vat = tva[2:]
     caller = session or requests
 
     def _parse(data: dict) -> str:
         return "✅ Valide" if data.get("isValid") or data.get("valid") else "❌ Invalide"
 
-    # ── Tentative v2 (POST JSON) ──────────────────────────────────────────
     for attempt in range(2):
         try:
             r = caller.post(_VIES_V2,
@@ -183,22 +173,19 @@ def vies_check(tva_str: str, session: requests.Session = None) -> str:
             if r.status_code in (404, 400):
                 return "❌ Invalide"
             if r.status_code == 429:
-                # Rate limit → attendre et réessayer une fois
                 if attempt == 0:
                     time.sleep(_VIES_RETRY_DELAY)
                     continue
                 return "⚠ Rate limit"
-            break   # autre code HTTP → essaie v1
+            break
         except requests.exceptions.Timeout:
             if attempt == 0:
                 time.sleep(_VIES_RETRY_DELAY)
                 continue
-            # Après retry → fallback v1
             break
         except Exception:
             break
 
-    # ── Fallback v1 (GET) ─────────────────────────────────────────────────
     for attempt in range(2):
         try:
             r = caller.get(_VIES_V1.format(ms=ms, vat=vat),
@@ -234,9 +221,7 @@ def api_get(params: dict, session: requests.Session = None) -> list:
 
 
 def best_etab(result: dict, cp_cible: str, siret_cible: str = "") -> dict:
-    """Choisit l'établissement le plus pertinent dans un résultat API."""
     siege = result.get("siege") or {}
-    # Parenthèses explicites : priorité correcte même si siege est falsy
     etabs = result.get("matching_etablissements") or ([siege] if siege else [])
     if not etabs:
         return siege
@@ -308,17 +293,13 @@ def _make_enriched(result: dict, etab: dict, mode: str) -> dict:
         "ville_trouvee":     (etab.get("libelle_commune") or etab.get("commune") or "").upper(),
         "siren_trouve":      out_siren,
         "siret_trouve":      out_siret,
-        "siren_brut":        siren_t,   # toujours disponible, indépendant du mode
+        "siren_brut":        siren_t,
         "tva_calcule":       "",
         "vies_result":       "",
     }
 
 
 def enrich_row(row: dict, session: requests.Session = None) -> tuple:
-    """Returns (enriched_dict, status, suggestions_list).
-    status : green | orange | red | suggestion
-    suggestions_list : non-vide si sélection manuelle requise
-    """
     intitule  = str(row.get("intitule",  "") or "").strip()
     adresse_o = str(row.get("adresse",   "") or "").strip()
     cp_o      = clean_cp(row.get("code_postal", ""))
@@ -333,7 +314,6 @@ def enrich_row(row: dict, session: requests.Session = None) -> tuple:
     has_geo = bool(cp_o or ville_o)
     get = lambda p: api_get(p, session)
 
-    # ── 1. Récupération des candidats ─────────────────────────────────────
     candidates: list = []
     if siret_o and len(siret_o) == 14:
         candidates = get({"q": siret_o, "per_page": 5})
@@ -351,17 +331,14 @@ def enrich_row(row: dict, session: requests.Session = None) -> tuple:
         if len(tokens) > 1:
             candidates = get({"q": " ".join(tokens[:3]), "per_page": 15})
 
-    # ── Fallback scraping si l'API ne donne rien du tout ──────────────────
     if not candidates:
         scraped = web_scrape_fallback(intitule, adresse_o, ville_o, cp_o, session)
         if scraped:
             return {}, "suggestion", scraped
         return {}, "red", []
 
-    # ── 2. Résolution des établissements (une seule fois par candidat) ────
     resolved = [(c, best_etab(c, cp_o, siret_o)) for c in candidates]
 
-    # ── 3. Filtre géo strict ──────────────────────────────────────────────
     if has_geo:
         geo_ok = []
         for c, etab in resolved:
@@ -375,14 +352,12 @@ def enrich_row(row: dict, session: requests.Session = None) -> tuple:
             dept = cp_o[:2] if cp_o else ""
             broad = (get({"q": intitule, "departement": dept, "per_page": 20}) if dept
                      else get({"q": intitule, "per_page": 20}))
-            # Si la recherche élargie est aussi vide, essai scraping web
             if not broad:
                 broad = web_scrape_fallback(intitule, adresse_o, ville_o, cp_o, session)
             return {}, "suggestion", broad[:20]
 
         resolved = geo_ok
 
-    # ── 4. Scoring ────────────────────────────────────────────────────────
     best_score, best_c, best_e = -999.0, None, {}
     for c, etab in resolved:
         s = _score(c, etab, intitule, adresse_o, cp_o, ville_o, siren_o, siret_o)
@@ -390,7 +365,6 @@ def enrich_row(row: dict, session: requests.Session = None) -> tuple:
             best_score, best_c, best_e = s, c, etab
 
     if best_c is None or best_score < 8:
-        # Même un score faible → proposer en suggestion plutôt que rouge
         scraped = web_scrape_fallback(intitule, adresse_o, ville_o, cp_o, session)
         if scraped:
             return {}, "suggestion", scraped
@@ -400,13 +374,11 @@ def enrich_row(row: dict, session: requests.Session = None) -> tuple:
     enriched = _make_enriched(best_c, best_e, mode)
 
     if token_sim(intitule, nom_t) < 0.40:
-        # Similarité insuffisante → proposer en suggestion
         scraped = web_scrape_fallback(intitule, adresse_o, ville_o, cp_o, session)
         if scraped:
             return enriched, "suggestion", scraped
         return enriched, "red", []
 
-    # ── 5. Statut final ───────────────────────────────────────────────────
     checks = []
     if cp_o:      checks.append(enriched["cp_trouve"] == cp_o)
     if ville_o:   checks.append(token_sim(ville_o, enriched["ville_trouvee"]) > 0.5)
@@ -417,41 +389,30 @@ def enrich_row(row: dict, session: requests.Session = None) -> tuple:
 
 
 def apply_suggestion(candidate: dict, cp_o: str, mode: str) -> dict:
-    """Construit enriched depuis un candidat choisi manuellement, respecte le CP."""
     etab = best_etab(candidate, cp_o)
     return _make_enriched(candidate, etab, mode)
 
 
 # ── Fallback scraping web ─────────────────────────────────────────────────────
-# Utilisé quand l'API SIRENE ne trouve rien (red) ou que la liste suggestion
-# est vide après filtre géo.
 _RE_SIREN_PATTERN = re.compile(r'\b(\d{3}[\s.\-]?\d{3}[\s.\-]?\d{3})\b')
 _SCRAPE_URLS = [
-    # DuckDuckGo HTML (sans API key, résultats FR)
     ("https://html.duckduckgo.com/html/", {"kl": "fr-fr"}),
-    # Bing (fallback)
     ("https://www.bing.com/search", {"setlang": "fr", "cc": "FR"}),
 ]
 
 
 def web_scrape_fallback(intitule: str, adresse: str = "", ville: str = "",
                         cp: str = "", session: requests.Session = None) -> list:
-    """
-    Cherche des SIRENs via scraping web, puis valide sur l'API SIRENE.
-    Appelé quand l'API ne renvoie rien (red) ou liste suggestion vide.
-    """
     caller = session or requests
     hdrs   = {**HEADERS, "Accept-Language": "fr-FR,fr;q=0.9",
               "Accept": "text/html,application/xhtml+xml"}
 
-    # ── Construction de la requête ────────────────────────────────────────
     parts = [intitule]
     if ville: parts.append(ville)
     if cp:    parts.append(cp)
     if adresse: parts.append(adresse.split()[0] if adresse.split() else "")
     query_siren = " ".join(p for p in parts if p) + " SIREN"
 
-    # ── 1. Extraction de SIRENs via scraping ─────────────────────────────
     sirens: set = set()
     for base_url, extra_params in _SCRAPE_URLS:
         if len(sirens) >= 10:
@@ -467,14 +428,11 @@ def web_scrape_fallback(intitule: str, adresse: str = "", ville: str = "",
                 for m in raw:
                     s = _RE_DIGITS_ONLY.sub("", m)
                     if len(s) == 9 and s not in sirens:
-                        # Filtre grossier : commence par un chiffre plausible
-                        # (les SIRENs commencent par 1-9)
                         if s[0] != "0":
                             sirens.add(s)
         except Exception:
             continue
 
-    # ── 2. Validation des SIRENs sur l'API SIRENE ─────────────────────────
     candidates: list = []
     seen_siren: set  = set()
     for siren in list(sirens)[:12]:
@@ -487,7 +445,6 @@ def web_scrape_fallback(intitule: str, adresse: str = "", ville: str = "",
         if len(candidates) >= 15:
             break
 
-    # ── 3. Fallback : recherche textuelle large si aucun SIREN extrait ────
     if not candidates:
         tokens = normalize(intitule).split()
         for n in range(min(len(tokens), 4), 0, -1):
@@ -496,7 +453,6 @@ def web_scrape_fallback(intitule: str, adresse: str = "", ville: str = "",
                 candidates.extend(hits)
                 break
 
-    # ── 4. Tri par similarité avec l'intitulé ─────────────────────────────
     candidates.sort(
         key=lambda c: token_sim(
             intitule, c.get("nom_complet") or c.get("nom_raison_sociale") or ""),
@@ -505,7 +461,7 @@ def web_scrape_fallback(intitule: str, adresse: str = "", ville: str = "",
     return candidates[:20]
 
 
-# ── Helpers openpyxl — objets immuables pré-calculés une fois au niveau module ─
+# ── Helpers openpyxl ──────────────────────────────────────────────────────────
 _XL_THIN        = Side(style="thin", color="E2E5F0")
 _XL_BRD         = Border(left=_XL_THIN, right=_XL_THIN, top=_XL_THIN, bottom=_XL_THIN)
 _XL_ALIGN_HDR   = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -519,7 +475,6 @@ _XL_FILLS       = {st: PatternFill("solid", fgColor=fc) for st, fc in _STATUS_FI
 
 
 def _xl_style_header(ws, n_src: int):
-    """Applique la mise en forme de la ligne d'en-tête (partagée export + gabarit)."""
     for ci, cell in enumerate(ws[1], 1):
         is_src         = ci <= n_src
         cell.fill      = _XL_FILL_HDR_S if is_src else _XL_FILL_HDR_F
@@ -722,29 +677,21 @@ class ColVisPanel(tk.Toplevel):
 
 # ── Fenêtre suggestions ───────────────────────────────────────────────────────
 class SuggestionWindow(tk.Toplevel):
-    """
-    Fenêtre modale de sélection manuelle d'un candidat.
-    Garanties :
-      - Une seule instance par ligne (gérée par App._suggestion_win)
-      - Modale (grab_set) : bloque l'interaction parent pendant la sélection
-      - Double-clic OU bouton "Appliquer" pour valider
-      - Bouton "Ignorer" pour passer sans rien choisir
-    """
     def __init__(self, parent, intitule, cp_orig, ville_orig, candidates, on_pick):
         super().__init__(parent)
         self.title(f"Suggestions — {intitule[:60]}")
         self.geometry("860x520")
         self.configure(bg=BG)
         self.resizable(True, True)
-        self.transient(parent)   # reste au-dessus du parent
+        self.transient(parent)
         self._candidates = candidates
         self._on_pick    = on_pick
-        self._tree_ref   = None  # référence au Treeview interne
+        self._tree_ref   = None
 
         self._build(intitule, cp_orig, ville_orig)
 
         self.lift()
-        self.grab_set()          # modal : bloque le reste de l'UI
+        self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
         self.bind("<Escape>", lambda e: self._on_cancel())
 
@@ -770,7 +717,6 @@ class SuggestionWindow(tk.Toplevel):
                  bg=PURPLE_BG, fg=PURPLE, font=("Segoe UI", 8, "bold"),
                  wraplength=820, justify="left", padx=10, pady=6).pack(anchor="w")
 
-        # ── Tableau des suggestions ──────────────────────────────────────
         tf = tk.Frame(self, bg=BG)
         tf.pack(fill="both", expand=True, padx=14, pady=(4, 0))
 
@@ -791,7 +737,7 @@ class SuggestionWindow(tk.Toplevel):
         for i, c in enumerate(self._candidates[:20]):
             nom  = c.get("nom_complet") or c.get("nom_raison_sociale") or "—"
             siren = c.get("siren", "")
-            etab  = best_etab(c, cp_orig)   # tient compte du CP d'origine
+            etab  = best_etab(c, cp_orig)
             tree.insert("", "end", iid=str(i),
                         values=(nom, siren, build_adr(etab),
                                 clean_cp(etab.get("code_postal", "")),
@@ -802,7 +748,6 @@ class SuggestionWindow(tk.Toplevel):
         tree.bind("<Double-1>",  self._on_tree_dbl)
         tree.bind("<Return>",    lambda e: self._apply())
 
-        # ── Barre de boutons ─────────────────────────────────────────────
         bf = tk.Frame(self, bg=CARD2)
         bf.pack(fill="x", pady=(6, 0))
 
@@ -820,7 +765,6 @@ class SuggestionWindow(tk.Toplevel):
                   padx=16, pady=8).pack(side="right", padx=8, pady=6)
 
     def _get_selected_idx(self) -> int | None:
-        """Retourne l'index candidat sélectionné, ou None."""
         if self._tree_ref is None:
             return None
         sel = self._tree_ref.selection()
@@ -832,7 +776,6 @@ class SuggestionWindow(tk.Toplevel):
             return None
 
     def _on_tree_dbl(self, event):
-        """Double-clic : vérifie que c'est bien une cellule (pas un en-tête)."""
         region = self._tree_ref.identify_region(event.x, event.y)
         if region not in ("cell", "tree"):
             return
@@ -873,24 +816,23 @@ class App(tk.Tk):
         self.minsize(1100, 650)
         self.configure(bg=BG)
 
-        # ── État ──
         self.df             = None
         self.col_index      = {}
-        self.results        = []        # list[None | {enriched, status, suggestions}]
-        self._row_cache     = []        # list[dict] — synchronized avec self.df
-        self._cache_dirty   = set()     # indices à reconstruire
-        self._counts        = {"green": 0, "orange": 0, "red": 0, "suggestion": 0, "pending": 0}  # stats incrémentales
-        self._done_count    = 0         # nb de lignes traitées (O(1) progress)
+        self.results        = []
+        self._row_cache     = []
+        self._cache_dirty   = set()
+        self._counts        = {"green": 0, "orange": 0, "red": 0, "suggestion": 0, "pending": 0}
+        self._done_count    = 0
         self.q              = queue.Queue()
         self._running       = False
         self._sort_col      = None
         self._sort_rev      = False
-        self._col_filters   = {}        # col_label -> set | None
+        self._col_filters   = {}
         self._col_visible   = dict(DEFAULT_VISIBLE)
         self._open_popup    = None
-        self._suggestion_win= None      # unique SuggestionWindow ouverte
-        self._sugg_guard    = False     # empêche _on_dbl_click si suggestion déjà ouverte
-        self._debounce_id   = None      # après(..) id pour debounce recherche
+        self._suggestion_win= None
+        self._sugg_guard    = False
+        self._debounce_id   = None
 
         self._build_styles()
         self._build_ui()
@@ -1080,7 +1022,7 @@ class App(tk.Tk):
         tf.columnconfigure(0, weight=1)
         self._tree.bind("<Button-1>",         self._on_click)
         self._tree.bind("<Double-1>",         self._on_dbl_click)
-        self._tree.bind("<Button-3>",         self._ctx_menu)
+        self._tree.bind("<Button-3>",         self._on_right_click)
         self._tree.bind("<<TreeviewSelect>>", self._on_selection_change)
         self._apply_displaycols()
 
@@ -1167,27 +1109,25 @@ class App(tk.Tk):
         p.geometry(f"240x420+{x}+{y}")
         self._open_popup = p
 
-    # ── Sélection native + clic sur badge Statut ─────────────────────────────
+    # ── Sélection native ─────────────────────────────────────────────────────
     def _on_selection_change(self, event=None):
-        """Met à jour le compteur quand la sélection Treeview change."""
         n_sel   = len(self._tree.selection())
         n_total = len(self.df) if self.df is not None else 0
         self._lbl_sel.config(text=f"{n_sel}/{n_total} sélectionné(s)")
 
     def _on_click(self, event):
-        """Clic gauche sur la cellule Statut d'une ligne suggestion → ouvre les suggestions.
-        Ignoré si clic droit ou si guard actif."""
-        if event.num != 1:          # ignorer clic droit / molette
+        if event.num != 1:
             return
         region = self._tree.identify_region(event.x, event.y)
         iid    = self._tree.identify_row(event.y)
         if region != "cell" or not iid:
             return
         try:
-            col_pos = int(self._tree.identify_column(event.x).replace("#", "")) - 1
+            display_cidx = int(self._tree.identify_column(event.x).replace("#", "")) - 1
+            real_idx     = self._display_col_to_real_idx(display_cidx)
         except ValueError:
             return
-        if col_pos == _STATUT_IDX:
+        if real_idx == _STATUT_IDX:
             rd = self._get_row_dict(int(iid))
             if rd["_status"] == "suggestion":
                 self._sugg_guard = True
@@ -1199,17 +1139,14 @@ class App(tk.Tk):
         self._sugg_guard = False
 
     def _set_sugg_guard(self):
-        """Pose le guard manuellement (depuis le menu contextuel)."""
         self._sugg_guard = True
         self.after(600, self._clear_sugg_guard)
 
     def _check_all(self):
-        """Sélectionne toutes les lignes visibles."""
         children = self._tree.get_children()
         self._tree.selection_set(*children)
 
     def _check_none(self):
-        """Désélectionne toutes les lignes."""
         self._tree.selection_remove(*self._tree.get_children())
 
     def _search_checked(self):
@@ -1238,7 +1175,6 @@ class App(tk.Tk):
         if self._open_popup and self._open_popup.winfo_exists():
             self._open_popup.destroy()
         ckey     = _COL_KEY[col_label]
-        # Filtre les None (lignes pas encore construites dans le cache lazy)
         all_vals = [rd.get(ckey, "") for rd in self._row_cache if rd is not None]
 
         def _on_change(lbl, sel_set):
@@ -1287,8 +1223,8 @@ class App(tk.Tk):
             self.df             = df
             self.col_index      = col_index
             self.results        = [None] * len(df)
-            self._row_cache     = [None] * len(df)      # lazy
-            self._cache_dirty   = set(range(len(df)))   # tout est dirty
+            self._row_cache     = [None] * len(df)
+            self._cache_dirty   = set(range(len(df)))
             self._counts     = {"green": 0, "orange": 0, "red": 0, "suggestion": 0, "pending": len(df)}
             self._done_count = 0
             self._col_filters.clear()
@@ -1315,13 +1251,10 @@ class App(tk.Tk):
             messagebox.showerror("Erreur import", str(e))
 
     def _gc(self, row, key: str) -> str:
-        """Lit une cellule mappée depuis une ligne DataFrame."""
         col = self.col_index.get(key)
-        # col_index est fixe après import : pas besoin de vérifier row.index à chaque fois
         return str(row[col]).strip() if col else ""
 
     def _build_row_dict(self, idx: int) -> dict:
-        """Construit le dict de rendu pour une ligne (résultat + source)."""
         row      = self.df.iloc[idx]
         res      = self.results[idx] or {}
         enriched = res.get("enriched", {})
@@ -1348,18 +1281,15 @@ class App(tk.Tk):
         }
 
     def _get_row_dict(self, idx: int) -> dict:
-        """Retourne le dict du cache, en reconstruisant si dirty."""
         if idx in self._cache_dirty or self._row_cache[idx] is None:
             self._row_cache[idx] = self._build_row_dict(idx)
             self._cache_dirty.discard(idx)
         return self._row_cache[idx]
 
     def _invalidate(self, idx: int):
-        """Marque une ligne comme dirty."""
         self._cache_dirty.add(idx)
 
     def _on_search_change(self, *_):
-        """Debounce : attend 200 ms après la dernière frappe avant de rafraîchir."""
         if self._debounce_id:
             self.after_cancel(self._debounce_id)
         self._debounce_id = self.after(200, self._refresh_table)
@@ -1372,7 +1302,6 @@ class App(tk.Tk):
         flt    = self._quick_filter.get()
         search = normalize(self._search_var.get())
 
-        # Reconstruire uniquement les entrées dirty
         for i in list(self._cache_dirty):
             self._row_cache[i] = self._build_row_dict(i)
         self._cache_dirty.clear()
@@ -1392,7 +1321,6 @@ class App(tk.Tk):
             if flt == "En attente" and st != "pending":    continue
 
             if search:
-                # Blob uniquement sur les clés affichables (pas _check/_status/_idx)
                 blob = normalize(" ".join(
                     str(rd.get(k, "")) for k in ALL_COL_KEYS if not k.startswith("_")
                 ))
@@ -1416,13 +1344,11 @@ class App(tk.Tk):
             self._tree.insert("", "end", iid=str(rd["_idx"]), tags=(tag,),
                               values=tuple(rd.get(k, "") for k in ALL_COL_KEYS))
 
-        # Stats depuis le compteur incrémental (O(1))
         self._sc_green.config(text=str(self._counts["green"]))
         self._sc_orange.config(text=str(self._counts["orange"]))
         self._sc_red.config(text=str(self._counts["red"]))
         self._sc_sugg.config(text=str(self._counts.get("suggestion", 0)))
         self._sc_pend.config(text=str(self._counts.get("pending", 0)))
-        # Le compteur est mis à jour par <<TreeviewSelect>> automatiquement
 
     # ── Recherche ─────────────────────────────────────────────────────────────
     def _start_search(self, only_checked: bool = False):
@@ -1448,7 +1374,6 @@ class App(tk.Tk):
         self._statusbar.config(text="⏹  Recherche interrompue.")
 
     def _worker(self, to_search: set):
-        """try/finally garantit que done est toujours envoyé."""
         try:
             with requests.Session() as session:
                 session.headers.update(HEADERS)
@@ -1488,10 +1413,8 @@ class App(tk.Tk):
                     break
 
                 if kind == "result":
-                    # Compteurs incrémentaux O(1)
-                    # Une ligne non encore traitée a statut "" → elle est "pending"
                     old_status = (self.results[idx] or {}).get("status", "pending")
-                    if old_status == "" :
+                    if old_status == "":
                         old_status = "pending"
                     if old_status in self._counts:
                         self._counts[old_status] -= 1
@@ -1511,7 +1434,6 @@ class App(tk.Tk):
                     self._statusbar.config(
                         text=f"Enrichissement : {pct:.0f}%  ({self._done_count}) — {name[:65]}")
 
-                    # Mise à jour ciblée de la ligne dans le Treeview
                     rd  = self._get_row_dict(idx)
                     tag = status if status in ("green","orange","red","suggestion") else "pending"
                     try:
@@ -1526,17 +1448,16 @@ class App(tk.Tk):
                     self._sc_red.config(text=str(self._counts["red"]))
                     self._sc_sugg.config(text=str(self._counts.get("suggestion", 0)))
                     self._sc_pend.config(text=str(self._counts.get("pending", 0)))
+
                 if kind == "vies":
-                    # ("vies", df_idx, done_count, total, tva, vies_result)
-                    done   = enriched   # done_count
-                    total  = status     # total
-                    tva    = suggestions  # tva string
-                    result = _extra     # vies result string
+                    done   = enriched
+                    total  = status
+                    tva    = suggestions
+                    result = _extra
                     self._progress["value"] = done
                     icon = "✅" if "Valide" in str(result) else ("❌" if result else "⚠")
                     self._statusbar.config(
                         text=f"VIES : {done}/{total}  {icon} {tva}  → {result}")
-                    # Mise à jour directe de la ligne dans le Treeview
                     self._invalidate(idx)
                     rd  = self._get_row_dict(idx)
                     tag = rd.get("_status","pending")
@@ -1572,7 +1493,6 @@ class App(tk.Tk):
                         f"  ❌ Invalides : {n_invalid}\n"
                         f"  ⚠  Erreurs  : {n_err}\n\n"
                         "La colonne «Ctrl VIES» est maintenant visible.")
-                    # Pas de break : vider la queue entièrement
 
         except queue.Empty:
             pass
@@ -1587,8 +1507,6 @@ class App(tk.Tk):
             if not res:
                 continue
             enriched = res.get("enriched", {})
-            # Ordre de priorité : siren_brut (toujours disponible) > siren_trouve >
-            # dérivé du siret_trouve (cas mode="siret" sans siren_brut)
             siren = (enriched.get("siren_brut", "")
                      or enriched.get("siren_trouve", ""))
             if not siren:
@@ -1612,13 +1530,9 @@ class App(tk.Tk):
 
     # ── Vérification VIES ────────────────────────────────────────────────────
     def _verify_vies_all(self):
-        """Vérification VIES sur les lignes SÉLECTIONNÉES dans le tableau.
-        Calcule la TVA à la volée si elle manque (siren_brut disponible).
-        Tourne dans un thread — UI jamais bloquée."""
         if self.df is None:
             return
 
-        # ── 1. Lignes sélectionnées dans le Treeview ──────────────────────
         sel_iids = self._tree.selection()
         if not sel_iids:
             messagebox.showwarning(
@@ -1629,8 +1543,6 @@ class App(tk.Tk):
 
         selected_idx = [int(iid) for iid in sel_iids]
 
-        # ── 2. Pour chaque ligne sélectionnée, s'assurer qu'un N° TVA existe ──
-        # Si tva_calcule est vide mais siren_brut/siren_trouve présent → calculer maintenant
         prepared = 0
         for idx in selected_idx:
             res = self.results[idx] if idx < len(self.results) else None
@@ -1638,7 +1550,6 @@ class App(tk.Tk):
                 continue
             enriched = res.get("enriched", {})
             if not enriched.get("tva_calcule", ""):
-                # Calcul à la volée
                 siren = (enriched.get("siren_brut", "")
                          or enriched.get("siren_trouve", ""))
                 if not siren:
@@ -1651,12 +1562,10 @@ class App(tk.Tk):
                     prepared += 1
 
         if prepared:
-            # Rafraîchir pour afficher les TVA nouvellement calculées
             self._col_visible["N° TVA"] = True
             self._apply_displaycols()
             self._refresh_table()
 
-        # ── 3. Construire la liste finale à vérifier ──────────────────────
         to_check = [
             idx for idx in selected_idx
             if (self.results[idx] if idx < len(self.results) else None)
@@ -1664,7 +1573,6 @@ class App(tk.Tk):
         ]
 
         if not to_check:
-            # Aucune TVA calculable parmi la sélection
             n_sel = len(selected_idx)
             messagebox.showinfo(
                 "Aucun N° TVA",
@@ -1674,7 +1582,6 @@ class App(tk.Tk):
                 "  • Le statut n'est pas ❌ Rouge (aucun résultat)")
             return
 
-        # ── 4. Lancement ──────────────────────────────────────────────────
         msg = f"Vérification VIES de {len(to_check)}/{len(selected_idx)} ligne(s) sélectionnée(s)"
         if prepared:
             msg += f" ({prepared} TVA calculée(s) à la volée)"
@@ -1695,8 +1602,6 @@ class App(tk.Tk):
         ).start()
 
     def _vies_worker(self, to_check: list):
-        """Thread de vérification VIES.
-        try/finally garantit que vies_done est toujours envoyé (UI jamais bloquée)."""
         try:
             with requests.Session() as session:
                 session.headers.update(_VIES_HDR)
@@ -1718,8 +1623,6 @@ class App(tk.Tk):
 
     # ── Double-clic ───────────────────────────────────────────────────────────
     def _on_dbl_click(self, event):
-        """Double-clic gauche → détail de la ligne.
-        Ignoré si le guard suggestion est actif (un clic vient d'ouvrir la suggestion)."""
         if self._sugg_guard or event.num != 1:
             return
         region = self._tree.identify_region(event.x, event.y)
@@ -1729,8 +1632,6 @@ class App(tk.Tk):
         self._show_detail(int(iid))
 
     def _open_suggestions(self, idx: int):
-        """Ouvre une unique SuggestionWindow modale pour la ligne idx."""
-        # Ferme toute fenêtre précédente
         if self._suggestion_win is not None:
             try:
                 if self._suggestion_win.winfo_exists():
@@ -1758,7 +1659,6 @@ class App(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Erreur", f"Impossible d'appliquer la suggestion :\n{e}")
                 return
-            # Mise à jour des compteurs : décrémente l'ancien statut, incrémente orange
             old_st = (self.results[idx] or {}).get("status", "")
             if old_st in self._counts:
                 self._counts[old_st] -= 1
@@ -1767,9 +1667,6 @@ class App(tk.Tk):
                                   "status": "orange", "suggestions": []}
             self._invalidate(idx)
             self._refresh_table()
-            # Activer TVA/VIES si ce n'est pas déjà le cas
-            # (au cas où la suggestion est appliquée avant que la recherche
-            #  n'ait activé ces boutons, ex. relance partielle)
             if enriched.get("siren_trouve") or enriched.get("siret_trouve"):
                 self._btn_tva.config_state(True)
             self._statusbar.config(
@@ -1785,7 +1682,6 @@ class App(tk.Tk):
         )
 
     def _show_detail(self, idx: int):
-        """Ouvre une fenêtre de détail (non modale) pour la ligne idx."""
         rd   = self._get_row_dict(idx)
         st   = rd.get("_status", "pending")
         hcol = {"green": GREEN, "orange": ORANGE,
@@ -1797,7 +1693,7 @@ class App(tk.Tk):
         win.title(f"Détail — {rd.get('intitule', '—')[:50]}")
         win.geometry("580x580")
         win.resizable(True, True)
-        win.transient(self)   # reste au-dessus sans bloquer
+        win.transient(self)
 
         tk.Frame(win, bg=hcol, height=4).pack(fill="x")
         hdr = tk.Frame(win, bg=CARD)
@@ -1808,7 +1704,6 @@ class App(tk.Tk):
                  font=("Segoe UI", 9, "bold"), padx=10, pady=4).pack(
                      side="right", padx=18, pady=12)
 
-        # Corps scrollable
         scroll_frame = tk.Frame(win, bg=BG)
         scroll_frame.pack(fill="both", expand=True)
         canvas = tk.Canvas(scroll_frame, bg=BG, highlightthickness=0)
@@ -1887,13 +1782,48 @@ class App(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(str(text))
 
+    # ── Helper : index colonne affichée → index réel ──────────────────────────
+    def _display_col_to_real_idx(self, display_cidx: int) -> int | None:
+        """Convertit un index de colonne affichée (identify_column, base 0)
+        en index réel dans ALL_COL_LABELS / values().
+        Indispensable quand des colonnes sont masquées via ⊞ Colonnes."""
+        try:
+            display_cols = list(self._tree["displaycolumns"])
+            if display_cidx < 0 or display_cidx >= len(display_cols):
+                return None
+            return ALL_COL_LABELS.index(display_cols[display_cidx])
+        except (ValueError, tk.TclError):
+            return None
+
+    # ── Clic droit : copie immédiate + menu ───────────────────────────────────
+    def _on_right_click(self, event):
+        """Clic droit : copie immédiatement la valeur survolée, puis affiche le menu.
+        Utilise _display_col_to_real_idx pour gérer les colonnes masquées."""
+        iid    = self._tree.identify_row(event.y)
+        col_id = self._tree.identify_column(event.x)
+        region = self._tree.identify_region(event.x, event.y)
+        if region == "cell" and iid and col_id:
+            try:
+                display_cidx = int(col_id.replace("#", "")) - 1
+                real_idx     = self._display_col_to_real_idx(display_cidx)
+                if real_idx is not None:
+                    val = self._tree.item(iid, "values")[real_idx]
+                    if val:
+                        self._copy(val)
+                        self._statusbar.config(text=f"📋  Copié : {str(val)[:80]}")
+            except Exception:
+                pass
+        self._ctx_menu(event)
+
     # ── Menu contextuel ───────────────────────────────────────────────────────
     def _ctx_menu(self, event):
         region = self._tree.identify_region(event.x, event.y)
         if region == "heading":
             cidx = int(self._tree.identify_column(event.x).replace("#", "")) - 1
-            if 0 <= cidx < len(ALL_COL_LABELS):
-                self._open_col_filter(ALL_COL_LABELS[cidx], event.x_root, event.y_root)
+            # Pour le heading, identify_column renvoie l'index parmi les colonnes affichées
+            real_idx = self._display_col_to_real_idx(cidx)
+            if real_idx is not None and 0 <= real_idx < len(ALL_COL_LABELS):
+                self._open_col_filter(ALL_COL_LABELS[real_idx], event.x_root, event.y_root)
             return
 
         if region != "cell":
@@ -1902,9 +1832,14 @@ class App(tk.Tk):
         col_id = self._tree.identify_column(event.x)
         if not (iid and col_id):
             return
-        cidx    = int(col_id.replace("#", "")) - 1
-        val     = self._tree.item(iid, "values")[cidx]
-        col_lbl = ALL_COL_LABELS[cidx]
+
+        display_cidx = int(col_id.replace("#", "")) - 1
+        real_idx     = self._display_col_to_real_idx(display_cidx)
+        if real_idx is None:
+            return
+
+        val     = self._tree.item(iid, "values")[real_idx]
+        col_lbl = ALL_COL_LABELS[real_idx]
         idx     = int(iid)
 
         menu = tk.Menu(self, tearoff=0, bg=CARD, fg=TEXT,
@@ -1990,7 +1925,6 @@ class App(tk.Tk):
         if self.df is None:
             return
 
-        # ── Guard : obligation d'avoir des lignes sélectionnées ──────────────
         to_export = sorted(int(iid) for iid in self._tree.selection())
         if not to_export:
             messagebox.showwarning(
